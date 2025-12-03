@@ -232,13 +232,8 @@ MM_SERVICESETTINGS_POSTPRIORITY=true
 MM_SERVICESETTINGS_ENABLECUSTOMEMOJI=true
 
 # --- Plugins (Force Enable for Entry Mode) ---
-MM_PLUGINSETTINGS_PLUGINSTATES='{
-    "playbooks": {"Enable": true},
-    "focalboard": {"Enable": true},
-    "com.mattermost.calls": {"Enable": true},
-    "mattermost-ai": {"Enable": true},
-    "com.github.manland.mattermost-plugin-gitlab": {"Enable": true}
-}'
+# NOTE: Docker env files DO NOT support multi-line values. This JSON must be single-line.
+MM_PLUGINSETTINGS_PLUGINSTATES='{"playbooks":{"Enable":true},"focalboard":{"Enable":true},"com.mattermost.calls":{"Enable":true},"mattermost-ai":{"Enable":true},"com.github.manland.mattermost-plugin-gitlab":{"Enable":true}}'
 
 # --- WebRTC (The Radio Tower) ---
 MM_PLUGINSETTINGS_PLUGINS_COM_MATTERMOST_CALLS_RTCSERVERPORT=8443
