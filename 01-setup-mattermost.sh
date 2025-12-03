@@ -10,7 +10,7 @@
 #  2. Database: Hot-patches PostgreSQL 15+ Schema Ownership.
 #  3. Certificates: Generates a "Mobile-Ready" SSL cert (.lan.crt.pem).
 #  4. Config: Generates the 'mattermost.env' 12-factor file.
-#  5. Permissions: Sets final ownership to UID 2000 (Mattermost).
+#  5. Permissions: Sets ownership for Bind Mounts ONLY.
 #
 # -----------------------------------------------------------
 
@@ -27,13 +27,8 @@ CA_DIR="$HOST_CICD_ROOT/ca"
 SERVICE_NAME="mattermost.cicd.local"
 CA_SERVICE_DIR="$CA_DIR/pki/services/$SERVICE_NAME"
 
-# Ensure directories exist
+# Ensure directories exist (Bind Mounts Only)
 mkdir -p "$MATTERMOST_BASE/config"
-mkdir -p "$MATTERMOST_BASE/data"
-mkdir -p "$MATTERMOST_BASE/logs"
-mkdir -p "$MATTERMOST_BASE/plugins"
-mkdir -p "$MATTERMOST_BASE/client/plugins"
-mkdir -p "$MATTERMOST_BASE/bleve-indexes"
 mkdir -p "$MATTERMOST_BASE/certs"
 
 # FIX: Temporarily claim ownership for the host user so we can write files
@@ -122,14 +117,13 @@ LAN_IP=$(hostname -I | awk '{print $1}')
 echo "Detected LAN IP: $LAN_IP"
 
 # Define Paths for the LAN-specific cert
-# We use .lan.key.pem / .lan.crt.pem to avoid overwriting the standard ones
 mkdir -p "$CA_SERVICE_DIR"
 LAN_KEY_FILE="$CA_SERVICE_DIR/$SERVICE_NAME.lan.key.pem"
 LAN_CSR_FILE="$CA_SERVICE_DIR/$SERVICE_NAME.lan.csr"
 LAN_CERT_FILE="$CA_SERVICE_DIR/$SERVICE_NAME.lan.crt.pem"
 EXT_FILE="$CA_SERVICE_DIR/v3.lan.ext"
 
-# Destination in Mattermost volume (standard names for config simplicity)
+# Destination in Mattermost volume
 MM_CERTS_DIR="$MATTERMOST_BASE/certs"
 
 if [ -f "$LAN_CERT_FILE" ]; then
@@ -160,7 +154,6 @@ EOF
 
     # 4. Sign with Root CA
     CA_ROOT_DIR="$CA_DIR/pki"
-    # Assuming CA pass is standard from previous articles
     openssl x509 -req -in "$LAN_CSR_FILE" \
         -CA "$CA_ROOT_DIR/certs/ca.pem" \
         -CAkey "$CA_ROOT_DIR/private/ca.key" \
@@ -173,7 +166,7 @@ EOF
     echo "Certificate generated: $LAN_CERT_FILE"
 fi
 
-# Always copy to the run directory (overwriting if changed)
+# Always copy to the run directory
 echo "Installing certificates to $MM_CERTS_DIR..."
 cp "$LAN_CERT_FILE" "$MM_CERTS_DIR/cert.pem"
 cp "$LAN_KEY_FILE" "$MM_CERTS_DIR/key.pem"
@@ -192,7 +185,7 @@ MM_SQLSETTINGS_DATASOURCE=postgres://mattermost:$MATTERMOST_DB_PASSWORD@postgres
 MM_SERVICESETTINGS_SITEURL=https://$SERVICE_NAME:8065
 MM_SERVICESETTINGS_LISTENADDRESS=:8065
 # Security: Allow local IPs (needed for Webhooks from other containers)
-# We strictly allow localhost, our specific Docker subnet (172.30.0.0/24), and the Host LAN IP.
+# We strictly allow: localhost, Docker subnet, and Host LAN IP
 MM_SERVICESETTINGS_ALLOWEDUNTRUSTEDINTERNALCONNECTIONS="127.0.0.1/8 172.30.0.0/24 $LAN_IP/32"
 
 # --- TLS Configuration (Application Level) ---
@@ -252,16 +245,20 @@ MM_PLUGINSETTINGS_PLUGINS_COM_MATTERMOST_CALLS_RTCSERVERPORT=8443
 MM_PLUGINSETTINGS_PLUGINS_COM_MATTERMOST_CALLS_ICESERVERSCONFIGS=[{"urls":["turn:$LAN_IP:3478"],"username":"mattermost","credential":"$MATTERMOST_TURN_SECRET"}]
 EOF
 
-# Secure the env file (readable by owner only for now)
+# Secure the env file (readable by owner only)
 chmod 600 "$SCOPED_ENV_FILE"
 
 # --- 6. Final Permissions Lock ---
 echo "--- Phase 5: Locking Permissions (UID 2000) ---"
-# Now that we are done writing, we hand over ownership to the Mattermost User
-sudo chown -R 2000:2000 "$MATTERMOST_BASE"
+# FIX: We ONLY chown the directories that need to be bind-mounted.
+# We leave the .env file owned by the current user so docker run can read it.
+sudo chown -R 2000:2000 "$MATTERMOST_BASE/config"
+sudo chown -R 2000:2000 "$MATTERMOST_BASE/certs"
+
 # The Key file must be readable by the app (0600 owned by 2000)
+# (Already handled by the recursive chown above, but ensuring mode)
 sudo chmod 600 "$MM_CERTS_DIR/key.pem"
 
 echo "✅ Setup Complete."
 echo "   - Config written to $SCOPED_ENV_FILE."
-echo "   - Directory ownership transferred to UID 2000."
+echo "   - Bind Mounts ownership transferred to UID 2000."
