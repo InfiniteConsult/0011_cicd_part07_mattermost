@@ -14,7 +14,7 @@ ENV_FILE = CICD_ROOT / "cicd.env"
 CONTAINER_NAME = "mattermost"
 # We use --local to bypass authentication (requires EnableLocalMode=true)
 MMCTL_CMD = ["docker", "exec", "-i", CONTAINER_NAME, "mmctl", "--local", "--json"]
-ADMIN_USER = "warren.jitsing" # Ensure this user exists via UI/SSO
+ADMIN_USER = "warren.jitsing" # The user who will own the webhooks
 
 # --- Entities to Create ---
 TEAM_NAME = "engineering"
@@ -114,10 +114,10 @@ def main():
         )
         print(f"   ✅ Channel '#{channel}' ensured.")
 
-    # 3. Create Jenkins Bot
-    print(f"--- Configuring Jenkins Bot ---")
+    # 3. Configure Jenkins Integration (Bot + Webhook)
+    print(f"--- Configuring Jenkins Integration ---")
 
-    # 3a. Ensure Password Exists
+    # 3a. Ensure Bot User Exists (Identity)
     bot_password = ""
     if "JENKINS_BOT_PASSWORD" in env_content:
         for line in env_content.splitlines():
@@ -129,37 +129,34 @@ def main():
         append_to_env("JENKINS_BOT_PASSWORD", bot_password)
         env_content += f"\nJENKINS_BOT_PASSWORD={bot_password}"
 
-    if "JENKINS_MATTERMOST_TOKEN" in env_content:
-        print("   ℹ️  JENKINS_MATTERMOST_TOKEN already exists in cicd.env. Skipping.")
+    bot_email = "jenkins-bot@cicd.local"
+    bot_user = "jenkins-bot"
+
+    print("   Ensuring Jenkins Bot User exists...")
+    run_mmctl(["user", "create", "--email", bot_email, "--username", bot_user, "--password", bot_password], allow_fail=True)
+    run_mmctl(["user", "verify", bot_user], allow_fail=True)
+    run_mmctl(["team", "users", "add", TEAM_NAME, bot_user], allow_fail=True)
+
+    # 3b. Create Webhook for Notifications (Required by Jenkins Notification Plugin)
+    if "JENKINS_MATTERMOST_WEBHOOK" in env_content:
+        print("   ℹ️  JENKINS_MATTERMOST_WEBHOOK already exists. Skipping.")
     else:
-        bot_email = "jenkins-bot@cicd.local"
-        bot_user = "jenkins-bot"
+        print("   Creating Incoming Webhook for #builds...")
+        # FIX: Use fully qualified channel name and ADMIN_USER ownership
+        hook_res = run_mmctl(["webhook", "create-incoming", "--user", ADMIN_USER, "--channel", f"{TEAM_NAME}:builds", "--display-name", "Jenkins", "--description", "Build Notifications"])
 
-        print("   Ensuring Jenkins Bot User exists...")
-        run_mmctl(["user", "create", "--email", bot_email, "--username", bot_user, "--password", bot_password], allow_fail=True)
-
-        run_mmctl(["user", "verify", bot_user], allow_fail=True)
-        run_mmctl(["team", "users", "add", TEAM_NAME, bot_user], allow_fail=True)
-
-        print("   Generating Access Token...")
-        token_res = run_mmctl(["token", "generate", bot_user, "Jenkins Integration"])
-
-        if token_res:
-            jenkins_token = token_res.get("token", "")
-            if jenkins_token:
-                append_to_env("JENKINS_MATTERMOST_TOKEN", jenkins_token)
-                env_content += f"\nJENKINS_MATTERMOST_TOKEN={jenkins_token}"
-        else:
-            print("   ⚠️  Failed to generate token (or output was empty).")
+        if hook_id := hook_res.get("id"):
+            webhook_url = f"https://mattermost.cicd.local:8065/hooks/{hook_id}"
+            append_to_env("JENKINS_MATTERMOST_WEBHOOK", webhook_url)
+            env_content += f"\nJENKINS_MATTERMOST_WEBHOOK={webhook_url}"
 
     # 4. Create SonarQube Webhook (#alerts)
     print(f"--- Configuring SonarQube Webhook ---")
 
     if "SONAR_MATTERMOST_WEBHOOK" in env_content:
-        print("   ℹ️  SONAR_MATTERMOST_WEBHOOK already exists in cicd.env. Skipping.")
+        print("   ℹ️  SONAR_MATTERMOST_WEBHOOK already exists. Skipping.")
     else:
         print("   Creating Incoming Webhook for #alerts...")
-        # FIX: Use fully qualified channel name: engineering:alerts
         hook_res = run_mmctl(["webhook", "create-incoming", "--user", ADMIN_USER, "--channel", f"{TEAM_NAME}:alerts", "--display-name", "SonarQube", "--description", "Quality Gate Alerts"])
 
         if hook_id := hook_res.get("id"):
@@ -171,10 +168,9 @@ def main():
     print(f"--- Configuring GitLab Webhook ---")
 
     if "MATTERMOST_CODE_REVIEW_WEBHOOK" in env_content:
-        print("   ℹ️  MATTERMOST_CODE_REVIEW_WEBHOOK already exists in cicd.env. Skipping.")
+        print("   ℹ️  MATTERMOST_CODE_REVIEW_WEBHOOK already exists. Skipping.")
     else:
         print("   Creating Incoming Webhook for #code-reviews...")
-        # FIX: Use fully qualified channel name: engineering:code-reviews
         hook_res = run_mmctl(["webhook", "create-incoming", "--user", ADMIN_USER, "--channel", f"{TEAM_NAME}:code-reviews", "--display-name", "GitLab", "--description", "Commit and Merge Request Events"])
 
         if hook_id := hook_res.get("id"):
