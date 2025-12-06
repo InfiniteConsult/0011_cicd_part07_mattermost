@@ -241,11 +241,23 @@ MM_SERVICESETTINGS_ENABLECUSTOMEMOJI=true
 MM_PLUGINSETTINGS_PLUGINSTATES={"playbooks":{"Enable":true},"focalboard":{"Enable":true},"com.mattermost.calls":{"Enable":true},"mattermost-ai":{"Enable":true},"com.github.manland.mattermost-plugin-gitlab":{"Enable":true}}
 
 # --- WebRTC (The Radio Tower) ---
-# We use the canonical MM_CALLS variables as defined in the official docs
-MM_CALLS_UDP_SERVER_PORT=8443
+# 1. Connectivity (Moved to 8444 to avoid conflict with Artifactory on 8443)
+MM_CALLS_UDP_SERVER_PORT=8444
+MM_CALLS_TCP_SERVER_PORT=8444
 MM_CALLS_ICE_SERVERS_CONFIGS=[{"urls":["turn:$LAN_IP:3478"],"username":"mattermost","credential":"$MATTERMOST_TURN_SECRET"}]
-# Optional: Force the plugin to use our LAN IP for the host candidates if STUN fails
+
+# 2. Network Stability
 MM_CALLS_ICE_HOST_OVERRIDE=$LAN_IP
+
+# 3. User Permissions
+MM_CALLS_DEFAULT_ENABLED=true
+
+# 4. Features
+MM_CALLS_ALLOW_SCREEN_SHARING=true
+MM_CALLS_ICE_HOST_PORT_OVERRIDE=8444
+
+MM_SERVICESETTINGS_ALLOWCORSFROM=*
+MM_SERVICESETTINGS_ENABLEINSECUREOUTGOINGCONNECTIONS=true
 EOF
 
 # Secure the env file (readable by owner only)

@@ -64,7 +64,8 @@ docker run -d \
   --network cicd-net \
   --hostname mattermost.cicd.local \
   --publish 0.0.0.0:8065:8065 \
-  --publish 0.0.0.0:8443:8443/udp \
+  --publish 0.0.0.0:8444:8444/udp \
+  --publish 0.0.0.0:8444:8444/tcp \
   --publish 127.0.0.1:8067:8067 \
   --env-file "$SCOPED_ENV_FILE" \
   --volume "$MATTERMOST_BASE/config":/mattermost/config:rw \
