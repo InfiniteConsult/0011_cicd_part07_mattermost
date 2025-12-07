@@ -265,7 +265,7 @@ MM_SERVICESETTINGS_ENABLECUSTOMEMOJI=true
 # --- Plugins (Force Enable for Entry Mode) ---
 # NOTE: We only enable them here. Specific config is handled by 08-configure-plugins.py
 # Added: com.mattermost.plugin-jenkins
-MM_PLUGINSETTINGS_PLUGINSTATES={"playbooks":{"Enable":true},"focalboard":{"Enable":true},"com.mattermost.calls":{"Enable":true},"mattermost-ai":{"Enable":true},"com.github.manland.mattermost-plugin-gitlab":{"Enable":true},"com.mattermost.plugin-jenkins":{"Enable":true}}
+MM_PLUGINSETTINGS_PLUGINSTATES={"playbooks":{"Enable":true},"focalboard":{"Enable":true},"com.mattermost.calls":{"Enable":true},"mattermost-ai":{"Enable":true},"com.github.manland.mattermost-plugin-gitlab":{"Enable":true},"jenkins":{"Enable":true}}
 
 # --- WebRTC (The Radio Tower) ---
 # 1. Connectivity (Moved to 8444 to avoid conflict with Artifactory on 8443)
