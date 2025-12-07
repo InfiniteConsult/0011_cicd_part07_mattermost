@@ -50,9 +50,14 @@ set -a
 source "$MASTER_ENV_FILE"
 set +a
 
-# Helper to generate random secrets
+# Helper: Generates 64-char string (Good for Salts/Secrets)
 generate_secret() {
     openssl rand -hex 32
+}
+
+# Helper: Generates 32-char string (REQUIRED for AES Encryption Keys)
+generate_aes_key() {
+    openssl rand -hex 16
 }
 
 # Verify DB password exists (from Article 9)
@@ -74,7 +79,7 @@ if [ -z "$MATTERMOST_TURN_SECRET" ]; then
 fi
 
 if [ -z "$MATTERMOST_AT_REST_KEY" ]; then
-    echo "Generating At-Rest Encryption Key..."
+    echo "Generating At-Rest Encryption Key (Core)..."
     echo "# Mattermost At-Rest Encryption Key" >> "$MASTER_ENV_FILE"
     echo "MATTERMOST_AT_REST_KEY=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
     update_env=true
@@ -84,6 +89,27 @@ if [ -z "$MATTERMOST_PUBLIC_LINK_SALT" ]; then
     echo "Generating Public Link Salt..."
     echo "# Mattermost Public Link Salt" >> "$MASTER_ENV_FILE"
     echo "MATTERMOST_PUBLIC_LINK_SALT=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+# Plugin Secrets (GitLab/Jenkins Interactive)
+if [ -z "$MATTERMOST_GITLAB_PLUGIN_SECRET" ]; then
+    echo "Generating GitLab Plugin Webhook Secret..."
+    echo "MATTERMOST_GITLAB_PLUGIN_SECRET=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+if [ -z "$MATTERMOST_GITLAB_PLUGIN_KEY" ]; then
+    echo "Generating GitLab Plugin Encryption Key (AES-256)..."
+    # FIX: Must be exactly 32 chars
+    echo "MATTERMOST_GITLAB_PLUGIN_KEY=\"$(generate_aes_key)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+if [ -z "$MATTERMOST_JENKINS_PLUGIN_KEY" ]; then
+    echo "Generating Jenkins Plugin Encryption Key (AES-256)..."
+    # FIX: Must be exactly 32 chars
+    echo "MATTERMOST_JENKINS_PLUGIN_KEY=\"$(generate_aes_key)\"" >> "$MASTER_ENV_FILE"
     update_env=true
 fi
 
@@ -237,8 +263,9 @@ MM_SERVICESETTINGS_POSTPRIORITY=true
 MM_SERVICESETTINGS_ENABLECUSTOMEMOJI=true
 
 # --- Plugins (Force Enable for Entry Mode) ---
-# NOTE: Single-line JSON without outer quotes to satisfy Docker env file parser
-MM_PLUGINSETTINGS_PLUGINSTATES={"playbooks":{"Enable":true},"focalboard":{"Enable":true},"com.mattermost.calls":{"Enable":true},"mattermost-ai":{"Enable":true},"com.github.manland.mattermost-plugin-gitlab":{"Enable":true}}
+# NOTE: We only enable them here. Specific config is handled by 08-configure-plugins.py
+# Added: com.mattermost.plugin-jenkins
+MM_PLUGINSETTINGS_PLUGINSTATES={"playbooks":{"Enable":true},"focalboard":{"Enable":true},"com.mattermost.calls":{"Enable":true},"mattermost-ai":{"Enable":true},"com.github.manland.mattermost-plugin-gitlab":{"Enable":true},"com.mattermost.plugin-jenkins":{"Enable":true}}
 
 # --- WebRTC (The Radio Tower) ---
 # 1. Connectivity (Moved to 8444 to avoid conflict with Artifactory on 8443)
@@ -256,6 +283,7 @@ MM_CALLS_DEFAULT_ENABLED=true
 MM_CALLS_ALLOW_SCREEN_SHARING=true
 MM_CALLS_ICE_HOST_PORT_OVERRIDE=8444
 
+# 5. Mobile & CORS Fixes
 MM_SERVICESETTINGS_ALLOWCORSFROM=*
 MM_SERVICESETTINGS_ENABLEINSECUREOUTGOINGCONNECTIONS=true
 EOF
