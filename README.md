@@ -494,4 +494,213 @@ In the environment file generation, we configure the **Calls** plugin immediatel
 
 * `MM_CALLS_ICE_HOST_OVERRIDE=$LAN_IP`: This forces the server to advertise the LAN IP, not the internal Docker IP (`172.x`), ensuring the phone knows where to send the video packets.
 * `MM_CALLS_UDP_SERVER_PORT=8444`: We shift the media port from the default (8443) to 8444. This avoids a collision with **Artifactory** (Article 9), which already claimed 8443 for its HTTPS interface. In a "City," port discipline is mandatory.
-* 
+
+# Chapter 4: The Radio Tower - Deploying Coturn
+
+## 4.1 The NAT Traversal Challenge
+
+With our "Town Square" foundation laid, we must now build the infrastructure that allows us to see and hear each other. We are deploying the Video Conferencing stack using the Mattermost **Calls** plugin.
+
+This requirement forces us to leave the comfortable world of HTTP and confront the chaotic reality of **WebRTC** (Web Real-Time Communication).
+
+In our previous articles, every service we deployed—GitLab, Jenkins, SonarQube—communicated using TCP/IP over HTTP. This model is simple: the client opens a connection to the server, sends a request, and waits for a response. It is reliable, predictable, and remarkably tolerant of network layers like Docker's bridge network and Nginx reverse proxies.
+
+**WebRTC is different.** It is designed for real-time audio and video, where latency is the enemy. It prefers **UDP** over TCP because it's faster to drop a lost packet than to wait for retransmission (a glitch is better than a lag). More importantly, WebRTC attempts to establish a **Peer-to-Peer (P2P)** connection directly between two devices to minimize latency.
+
+In a containerized environment, this P2P model breaks instantly.
+
+When your phone (on WiFi) tries to send video to the Mattermost server (in a container), it needs an IP address to target. However, the Mattermost container lives inside a Docker Bridge network. It has an internal IP (e.g., `172.18.0.5`) that is completely invisible to the outside world. To make matters worse, your phone is likely behind its own NAT (Network Address Translation). This scenario is known as **Double NAT**, and it acts as an unbridgeable moat for direct media streams.
+
+To bridge this moat, we need a **TURN Server** (Traversal Using Relays around NAT). We will deploy **Coturn**, the industry-standard open-source TURN server.
+
+Architecturally, Coturn acts as a **"Radio Tower."** It sits on the absolute edge of our network. When direct P2P communication fails (which it always will in Docker), the phone sends its media packets to the Radio Tower. The Tower then relays those packets across the Docker boundary to the Mattermost container.
+
+## 4.2 The Solution (`02-deploy-coturn.sh`)
+
+But deploying Coturn brings its own "Dragon": **The Port Range.**
+
+Unlike a web server that listens on a single port (443), a TURN server requires a massive range of ephemeral UDP ports—typically **49,152 to 65,535**—to handle media streams for multiple users simultaneously. Every active call consumes a port.
+
+If we tried to deploy this using standard Docker Bridge networking, we would have to map every single one of these ports in the `docker run` command. This creates two critical problems:
+
+1.  **The "Docker Proxy" Bottleneck:** For every mapped port, Docker spins up a userland proxy process (`docker-proxy`). Asking Docker to manage 16,000+ proxy rules explodes the memory usage and adds significant CPU latency to every packet, killing call quality.
+2.  **IPTables Bloat:** Creating tens of thousands of NAT rules in the host's firewall table slows down networking for the entire system.
+
+To solve this, we will make a rare exception to our "Isolation First" rule. We will deploy the Coturn container using **Host Networking** (`--network host`).
+
+This mode effectively removes the Docker network isolation layer for this specific container. Coturn will not have a private `172.x.x.x` IP; it will bind directly to the physical network interface of your host machine (`192.168.x.x`). This eliminates the need for port mapping entirely. It gives our Radio Tower a clear, unobstructed line of sight to your mobile device, ensuring that when you press "Join Call," the video flows instantly and efficiently.
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/02-deploy-coturn.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               02-deploy-coturn.sh
+#
+#  The "Radio Tower" script.
+#  Deploys a Coturn STUN/TURN server for WebRTC media relay.
+#
+#  1. Network: Uses '--network host' to bypass Docker NAT.
+#  2. Config:  Injects the shared secret generated in Step 01.
+#  3. Identity: Auto-detects LAN IP for the --external-ip flag.
+#
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Deploying Coturn (Radio Tower)..."
+
+# --- 1. Load Secrets ---
+MASTER_ENV_FILE="$HOME/cicd_stack/cicd.env"
+if [ ! -f "$MASTER_ENV_FILE" ]; then
+    echo "ERROR: Master env file not found at $MASTER_ENV_FILE"
+    exit 1
+fi
+source "$MASTER_ENV_FILE"
+
+if [ -z "$MATTERMOST_TURN_SECRET" ]; then
+    echo "ERROR: MATTERMOST_TURN_SECRET not found in cicd.env"
+    echo "Please run 01-setup-mattermost.sh first."
+    exit 1
+fi
+
+# --- 2. Detect Host IP ---
+# We need to tell Coturn what its external IP is so it can
+# advertise it to clients (phones/browsers).
+# hostname -I returns all IPs; awk '{print $1}' takes the first one.
+LAN_IP=$(hostname -I | awk '{print $1}')
+
+if [ -z "$LAN_IP" ]; then
+    echo "ERROR: Could not detect LAN IP."
+    exit 1
+fi
+
+echo "📡 Radio Tower Configuration:"
+echo "   - Listening IP: 0.0.0.0"
+echo "   - External IP:  $LAN_IP (Advertised to clients)"
+echo "   - Realm:        mattermost.cicd.local"
+echo "   - Network:      Host Mode (Bypassing Docker Bridge)"
+
+# --- 3. Clean Slate ---
+if [ "$(docker ps -q -f name=coturn)" ]; then
+    echo "Stopping existing 'coturn'..."
+    docker stop coturn
+fi
+if [ "$(docker ps -aq -f name=coturn)" ]; then
+    echo "Removing existing 'coturn'..."
+    docker rm coturn
+fi
+
+# --- 4. Deploy ---
+# We use the official coturn image.
+# We pass configuration flags directly to the command.
+# Note: --network host is critical here for UDP performance.
+
+docker run -d \
+  --name coturn \
+  --network host \
+  --restart always \
+  coturn/coturn \
+  -n \
+  --log-file=stdout \
+  --min-port=49152 \
+  --max-port=65535 \
+  --realm=mattermost.cicd.local \
+  --listening-ip=0.0.0.0 \
+  --external-ip=$LAN_IP \
+  --use-auth-secret \
+  --static-auth-secret=$MATTERMOST_TURN_SECRET
+
+echo "✅ Coturn deployed."
+echo "   Verify logs with: docker logs -f coturn"
+```
+
+### Deconstructing the Radio Tower
+
+**1. The IP Detection (`hostname -I`)**
+Coturn needs to know "who it is" to function correctly. When a phone asks for a relay candidate, Coturn must respond with an IP address that the phone can actually reach. We automate this by detecting the host's LAN IP at runtime and passing it to `--external-ip`. If we hardcoded this or let it default, Coturn might advertise an internal loopback address, causing call failures.
+
+**2. The "No-Map" Deployment (`--network host`)**
+Notice that there are no `-p 3478:3478` or `-p 49152:49152` flags in the `docker run` command. Because we used `--network host`, the container essentially "becomes" the host networking stack. It opens these sockets directly on the host's interface. This is the secret to high-performance WebRTC in Docker.
+
+**3. The Shared Secret (`--static-auth-secret`)**
+This ties back to **Article 3**. We inject the `MATTERMOST_TURN_SECRET`. This ensures that our Radio Tower isn't an open relay for the internet. It will only relay traffic for clients that present a valid token signed by our Mattermost server using this exact key.
+
+## 4.3 The Verification (`test-turn-server.py`)
+
+Before we try to connect a complex application like Mattermost to this Radio Tower, we must verify that the Tower is actually broadcasting. If we skip this step, debugging broken video calls later becomes a guessing game: is it the Android app? The certificate? The firewall? Or the TURN server itself?
+
+We will perform a "Smoke Test" using the industry-standard **Trickle ICE** diagnostic tool.
+
+To do this securely, we cannot just guess a username and password. Our TURN server is protected by the Time-Limited Credential mechanism. We need to generate a valid, signed token that expires in 24 hours.
+
+We will write a small Python script to generate these credentials using the `MATTERMOST_TURN_SECRET` from our environment file.
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/test-turn-server.py`.
+
+```python
+# https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/
+import hashlib, hmac, base64, time
+from pathlib import Path
+
+# Load Secret
+env_path = Path.home() / "cicd_stack" / "cicd.env"
+secret = ""
+with open(env_path) as f:
+    for line in f:
+        if "MATTERMOST_TURN_SECRET" in line:
+            secret = line.split("=")[1].strip().strip("\"")
+
+if not secret:
+    print("Error: Could not find secret")
+    exit(1)
+
+# Generate Credentials (valid for 24 hours)
+timestamp = int(time.time()) + (24 * 3600)
+username = f"{timestamp}:testuser"
+dig = hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()
+password = base64.b64encode(dig).decode()
+
+print("\n=== TURN Credentials (Valid 24h) ===")
+print(f"Username: {username}")
+print(f"Password: {password}")
+print("====================================")
+```
+
+### Deconstructing the Smoke Test
+
+This script implements the standard TURN REST API hashing algorithm. It combines a timestamp (valid for 24 hours) with a username, signs it with our secret key using HMAC-SHA1, and Base64 encodes the result. This matches exactly what the Mattermost server does internally when a user requests to join a call.
+
+### Execution: The Trickle ICE Test
+
+Now, we perform the physical test.
+
+1.  **Generate Credentials:** Run the script on your host.
+
+    ```bash
+    python3 test-turn-server.py
+    ```
+
+    Copy the **Username** and **Password** output.
+
+2.  **Open the Diagnostics Tool:**
+    On a **different device** (like your phone or a laptop on the same WiFi, *not* the host running Docker), open this URL:
+    [https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/)
+
+3.  **Configure the Server:**
+
+    * **STUN or TURN URI:** `turn:<YOUR_LAN_IP>:3478` (e.g., `turn:192.168.0.105:3478`)
+    * **TURN username:** (Paste from script)
+    * **TURN password:** (Paste from script)
+
+4.  **Run the Test:** Click **"Gather candidates"**.
+
+**The Success Criteria:**
+You are looking for a specific row in the output table.
+
+* **Component Type:** `rtcp` or `rtp`
+* **Type:** **`relay`** (This is the critical keyword).
+* **Protocol:** `udp`
+
+If you see a candidate of type **`relay`**, it means your device successfully contacted the Coturn server, authenticated with the secret, and received a relay address. The Radio Tower is operational. If you only see `host` or `srflx` candidates, the TURN server is unreachable (check your firewall) or authentication failed (check your secret).
