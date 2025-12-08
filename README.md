@@ -110,3 +110,388 @@ If we tried to deploy this using standard Docker Bridge networking, we would hav
 To solve this, we will make a rare exception to our "Isolation First" rule. We will deploy the Coturn container using **Host Networking** (`--network host`).
 
 This mode effectively removes the Docker network isolation layer for this specific container. Coturn will not have a private `172.x.x.x` IP; it will bind directly to the physical network interface of your host machine (`192.168.x.x`). This eliminates the need for port mapping entirely. It gives our Radio Tower a clear, unobstructed line of sight to your mobile device, ensuring that when you press "Join Call," the video flows instantly and efficiently.
+
+# Chapter 3: The Architect - Preparing the Ground
+
+## 3.1 Database Hygiene (Postgres 15+ Compliance)
+
+Before we write a single line of configuration code, we must attend to the soil in which we are planting our application. We are using **PostgreSQL 17** as our shared data store. While this gives us performance and longevity, it also brings strict security defaults that can strangle legacy applications if we aren't careful.
+
+Specifically, PostgreSQL 15 introduced a breaking change regarding schema ownership. In older versions, any user could create tables in the `public` schema by default. In 15+, this permission was revoked to harden the database against accidental pollution.
+
+Mattermost, like many mature applications, expects to own its schema completely. It performs complex migrations on startup—creating tables, altering columns, and indexing data. If the database user (`mattermost`) does not explicitly own the `public` schema, these migrations can fail. Often, this failure is silent or cryptic, manifesting as a boot loop where the logs complain about "permission denied" on a table that doesn't exist yet.
+
+To prevent this "Silent Crash," we cannot just create the user and hope for the best. Our setup script must actively intervene. We will use the `psql` client to execute a targeted `ALTER SCHEMA` command, explicitly transferring ownership of the `public` schema in the `mattermost` database to the `mattermost` user. This restores the "God Mode" permissions the application expects within its own sandbox, ensuring smooth migrations for years to come.
+
+## 3.2 The "Mobile-Ready" Certificate
+
+With our database secured, we must address the single biggest friction point in self-hosted DevOps: **Mobile Trust**.
+
+In our previous articles, we connected our desktop browsers to our internal tools using a simple trick. We updated our `/etc/hosts` file to map `gitlab.cicd.local` to `127.0.0.1`. Because we had imported our Root CA into the desktop's trust store, the browser saw a valid certificate for a valid domain and gave us the green lock.
+
+Mobile devices, however, exist in a more hostile networking environment.
+
+Modern Android (11+) and iOS devices lock down their DNS settings. You cannot simply edit a "hosts file" on a non-rooted phone to tell it that `mattermost.cicd.local` resides on your laptop. When your phone is on the office WiFi, it uses the router's DNS. If that router doesn't know your internal domain (which it won't, because we don't have a custom DNS server like Pi-hole), the phone will fail to resolve the address.
+
+The pragmatic workaround is to bypass DNS entirely and connect via the **LAN IP Address** (e.g., `https://192.168.0.105:8065`).
+
+This solves the network path, but it breaks the **TLS Identity Trust**. Standard SSL certificates are bound to **Domain Names** (DNS entries). If you present a certificate issued to `mattermost.cicd.local` but the user is visiting `192.168.0.105`, the client will reject the connection immediately because the "Host" does not match the "Certificate Name." This is a fundamental protection against Phishing and Man-in-the-Middle attacks.
+
+To conquer this, we must engineer a **"Mobile-Ready" Certificate**.
+
+We cannot use the generic issuance script we built in Article 6. We need a specialized signing request that explicitly creates a **Subject Alternative Name (SAN)** entry for the IP address. By baking `IP:192.168.x.x` directly into the certificate's cryptographic identity, we tell the mobile OS: *"It is legal and valid for this server to be accessed via this raw IP address."*
+
+Our architect script will automate this. It will dynamically detect your host's LAN IP (`hostname -I`), construct a custom OpenSSL configuration file with the required SAN extensions, and mint a certificate that satisfies the strict identity requirements of modern mobile operating systems.
+
+## 3.3 Secrets Management
+
+Beyond certificates and database permissions, a secure Mattermost deployment relies on a specific set of cryptographic keys. These are not simple passwords that you can type in; they are high-entropy strings that underpin the security of the application's data at rest and in transit.
+
+If we leave these default or empty, we compromise the integrity of our fortress. Our Architect script manages three critical secrets:
+
+1.  **The At-Rest Encryption Key (`MM_SQLSETTINGS_ATRESTENCRYPTKEY`):**
+    Mattermost stores sensitive data in the Postgres database, including OAuth tokens for GitLab and incoming webhook secrets for Jenkins. If an attacker managed to dump our database, these tokens would be exposed in plain text. By configuring an At-Rest Encryption Key (32-character AES), we ensure that Mattermost encrypts these sensitive fields before writing them to the disk.
+
+2.  **The Public Link Salt (`MM_FILESETTINGS_PUBLICLINKSALT`):**
+    When a user shares a file via a public link, the URL is generated using a hash function. Without a strong, random salt, these links become predictable, potentially allowing an external attacker to enumerate and download private files by guessing URL patterns.
+
+3.  **The TURN Shared Secret (`MATTERMOST_TURN_SECRET`):**
+    This is the most critical key for our "War Room" functionality. The Coturn (Radio Tower) server and the Mattermost (Town Square) server are separate entities. To prevent unauthorized users from hijacking our bandwidth to relay their own traffic, the TURN server requires authentication.
+    We do not use a static username/password for this. Instead, we use a **Time-Limited Credential** mechanism. Both servers share this single, long secret key. Mattermost uses it to generate temporary, short-lived tokens for your phone when you join a call. Coturn uses the same key to validate those tokens. If these keys do not match exactly, the call fails instantly.
+
+Our script uses `openssl rand -hex` to generate these strings. Crucially, as we discovered during our GitLab integration debugging (Chapter 9), we must be precise about length. For AES-256 encryption, the key must be exactly **32 bytes**. A 64-byte key (often generated by overzealous `openssl` commands) will cause the application's crypto subsystem to crash on boot.
+
+We persist these keys in our master `cicd.env` file, ensuring that our "Radio Tower" and our "Town Square" always wake up knowing the same handshake.
+
+## 3.4 The Script (`01-setup-mattermost.sh`)
+
+We have defined our requirements: Postgres 15+ hygiene, mobile-ready networking, and cryptographic security. Now, we codify these rules into our "Architect" script.
+
+This script is the single source of truth for the Mattermost deployment. It does not launch the container; it prepares the battlefield. It ensures that when the container finally starts, it lands in an environment that is secure, configured, and trusted.
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/01-setup-mattermost.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               01-setup-mattermost.sh
+#
+#  The "Architect" script for Mattermost.
+#
+#  1. Secrets: Generates TURN credentials and Salt keys.
+#  2. Database: Hot-patches PostgreSQL 15+ Schema Ownership.
+#  3. Certificates: Generates a "Mobile-Ready" SSL cert (.lan.crt.pem).
+#  4. Config: Generates the 'mattermost.env' 12-factor file.
+#  5. Permissions: Sets ownership for Bind Mounts ONLY.
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- 1. Define Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+MATTERMOST_BASE="$HOST_CICD_ROOT/mattermost"
+MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
+SCOPED_ENV_FILE="$MATTERMOST_BASE/mattermost.env"
+
+# Certificate Authority Paths
+CA_DIR="$HOST_CICD_ROOT/ca"
+SERVICE_NAME="mattermost.cicd.local"
+CA_SERVICE_DIR="$CA_DIR/pki/services/$SERVICE_NAME"
+
+# Ensure directories exist (Bind Mounts Only)
+mkdir -p "$MATTERMOST_BASE/config"
+mkdir -p "$MATTERMOST_BASE/certs"
+
+# FIX: Temporarily claim ownership for the host user so we can write files
+echo "🔧 Setting temporary permissions for setup..."
+sudo chown -R "$USER":"$USER" "$MATTERMOST_BASE"
+
+echo "🚀 Starting Mattermost 'Architect' Setup..."
+
+# --- 2. Secrets Management ---
+echo "--- Phase 1: Secrets Management ---"
+
+if [ ! -f "$MASTER_ENV_FILE" ]; then
+    echo "ERROR: Master env file not found at $MASTER_ENV_FILE"
+    exit 1
+fi
+
+# Load existing secrets
+set -a
+source "$MASTER_ENV_FILE"
+set +a
+
+# Helper: Generates 64-char string (Good for Salts/Secrets)
+generate_secret() {
+    openssl rand -hex 32
+}
+
+# Helper: Generates 32-char string (REQUIRED for AES Encryption Keys)
+generate_aes_key() {
+    openssl rand -hex 16
+}
+
+# Verify DB password exists (from Article 9)
+if [ -z "$MATTERMOST_DB_PASSWORD" ]; then
+    echo "ERROR: MATTERMOST_DB_PASSWORD not found in cicd.env"
+    echo "Please run 01-setup-database.sh (Article 9) first."
+    exit 1
+fi
+
+# Generate new Mattermost-specific secrets if missing
+update_env=false
+
+if [ -z "$MATTERMOST_TURN_SECRET" ]; then
+    echo "Generating TURN Shared Secret..."
+    echo "" >> "$MASTER_ENV_FILE"
+    echo "# Mattermost & Coturn Shared Secret" >> "$MASTER_ENV_FILE"
+    echo "MATTERMOST_TURN_SECRET=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+if [ -z "$MATTERMOST_AT_REST_KEY" ]; then
+    echo "Generating At-Rest Encryption Key (Core)..."
+    echo "# Mattermost At-Rest Encryption Key" >> "$MASTER_ENV_FILE"
+    echo "MATTERMOST_AT_REST_KEY=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+if [ -z "$MATTERMOST_PUBLIC_LINK_SALT" ]; then
+    echo "Generating Public Link Salt..."
+    echo "# Mattermost Public Link Salt" >> "$MASTER_ENV_FILE"
+    echo "MATTERMOST_PUBLIC_LINK_SALT=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+# Plugin Secrets (GitLab/Jenkins Interactive)
+if [ -z "$MATTERMOST_GITLAB_PLUGIN_SECRET" ]; then
+    echo "Generating GitLab Plugin Webhook Secret..."
+    echo "MATTERMOST_GITLAB_PLUGIN_SECRET=\"$(generate_secret)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+if [ -z "$MATTERMOST_GITLAB_PLUGIN_KEY" ]; then
+    echo "Generating GitLab Plugin Encryption Key (AES-256)..."
+    # FIX: Must be exactly 32 chars
+    echo "MATTERMOST_GITLAB_PLUGIN_KEY=\"$(generate_aes_key)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+if [ -z "$MATTERMOST_JENKINS_PLUGIN_KEY" ]; then
+    echo "Generating Jenkins Plugin Encryption Key (AES-256)..."
+    # FIX: Must be exactly 32 chars
+    echo "MATTERMOST_JENKINS_PLUGIN_KEY=\"$(generate_aes_key)\"" >> "$MASTER_ENV_FILE"
+    update_env=true
+fi
+
+# Reload secrets if we added any
+if [ "$update_env" = true ]; then
+    source "$MASTER_ENV_FILE"
+    echo "Secrets generated and persisted."
+else
+    echo "Secrets already exist."
+fi
+
+# --- 3. Database Schema Ownership Fix (Postgres 15+) ---
+echo "--- Phase 2: Verifying Database Schema Ownership ---"
+# Postgres 15+ revokes permission to create tables in 'public' from regular users.
+# We apply this fix specifically to the 'mattermost' database.
+
+if [ "$(docker ps -q -f name=postgres)" ]; then
+    echo "Applying PostgreSQL 15+ schema ownership fix..."
+    docker exec -i postgres psql -U postgres -d mattermost -c "ALTER SCHEMA public OWNER TO mattermost;" || true
+    echo "Database schema permissions verified."
+else
+    echo "WARNING: Postgres container not running. Skipping DB patch."
+    echo "Ensure postgres is running before deploying Mattermost."
+fi
+
+# --- 4. Mobile-Ready Certificate Generation ---
+echo "--- Phase 3: Generating Mobile-Ready SSL Certificate ---"
+
+# Detect LAN IP (First non-loopback IP)
+LAN_IP=$(hostname -I | awk '{print $1}')
+echo "Detected LAN IP: $LAN_IP"
+
+# Define Paths for the LAN-specific cert
+mkdir -p "$CA_SERVICE_DIR"
+LAN_KEY_FILE="$CA_SERVICE_DIR/$SERVICE_NAME.lan.key.pem"
+LAN_CSR_FILE="$CA_SERVICE_DIR/$SERVICE_NAME.lan.csr"
+LAN_CERT_FILE="$CA_SERVICE_DIR/$SERVICE_NAME.lan.crt.pem"
+EXT_FILE="$CA_SERVICE_DIR/v3.lan.ext"
+
+# Destination in Mattermost volume
+MM_CERTS_DIR="$MATTERMOST_BASE/certs"
+
+if [ -f "$LAN_CERT_FILE" ]; then
+    echo "Existing LAN certificate found. Skipping generation."
+else
+    echo "Generating new LAN certificate..."
+
+    # 1. Generate Key
+    openssl genrsa -out "$LAN_KEY_FILE" 4096
+
+    # 2. Create specific SAN config including the LAN IP
+    cat > "$EXT_FILE" <<EOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = $SERVICE_NAME
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+IP.2 = $LAN_IP
+EOF
+
+    # 3. Generate CSR
+    openssl req -new -key "$LAN_KEY_FILE" -out "$LAN_CSR_FILE" \
+        -subj "/C=ZA/ST=Gauteng/L=Johannesburg/O=Local CICD/CN=$SERVICE_NAME"
+
+    # 4. Sign with Root CA
+    CA_ROOT_DIR="$CA_DIR/pki"
+    # Assuming CA pass is standard from previous articles
+    openssl x509 -req -in "$LAN_CSR_FILE" \
+        -CA "$CA_ROOT_DIR/certs/ca.pem" \
+        -CAkey "$CA_ROOT_DIR/private/ca.key" \
+        -CAcreateserial -out "$LAN_CERT_FILE" \
+        -days 365 \
+        -sha256 \
+        -extfile "$EXT_FILE" \
+        -passin pass:your_secure_password
+    
+    echo "Certificate generated: $LAN_CERT_FILE"
+fi
+
+# Always copy to the run directory
+echo "Installing certificates to $MM_CERTS_DIR..."
+cp "$LAN_CERT_FILE" "$MM_CERTS_DIR/cert.pem"
+cp "$LAN_KEY_FILE" "$MM_CERTS_DIR/key.pem"
+
+# --- 5. Generate Scoped Environment File ---
+echo "--- Phase 4: Generating mattermost.env ---"
+
+# NOTE: We remove quotes around simple string values (default_on, id_loaded)
+# because docker --env-file might pass the quotes literally, breaking validation.
+cat << EOF > "$SCOPED_ENV_FILE"
+# Scoped Environment for Mattermost
+# Generated by 01-setup-mattermost.sh
+
+# --- Core Identity ---
+MM_SQLSETTINGS_DRIVERNAME=postgres
+# Note: We use the internal Docker DNS 'postgres.cicd.local'
+# FIX: sslmode=verify-full because we enforce SSL in Postgres and inject the CA into Mattermost
+MM_SQLSETTINGS_DATASOURCE=postgres://mattermost:$MATTERMOST_DB_PASSWORD@postgres.cicd.local:5432/mattermost?sslmode=verify-full&connect_timeout=10
+MM_SERVICESETTINGS_SITEURL=https://$SERVICE_NAME:8065
+MM_SERVICESETTINGS_LISTENADDRESS=:8065
+# Security: Allow local IPs (needed for Webhooks from other containers)
+# We strictly allow: localhost, Docker subnet, and Host LAN IP
+MM_SERVICESETTINGS_ALLOWEDUNTRUSTEDINTERNALCONNECTIONS="127.0.0.1/8 172.30.0.0/24 $LAN_IP/32"
+
+# --- TLS Configuration (Application Level) ---
+MM_SERVICESETTINGS_CONNECTIONSECURITY=TLS
+MM_SERVICESETTINGS_TLSCERTFILE=/mattermost/certs/cert.pem
+MM_SERVICESETTINGS_TLSKEYFILE=/mattermost/certs/key.pem
+
+# --- Security & Privacy ---
+MM_SERVICESETTINGS_ENABLELOCALMODE=true
+MM_EMAILSETTINGS_PUSHNOTIFICATIONCONTENTS=id_loaded
+MM_FILESETTINGS_PUBLICLINKSALT=$MATTERMOST_PUBLIC_LINK_SALT
+MM_SQLSETTINGS_ATRESTENCRYPTKEY=$MATTERMOST_AT_REST_KEY
+
+# --- Developer Experience ---
+MM_SERVICESETTINGS_ENABLELATEX=true
+MM_SERVICESETTINGS_ENABLEINLINELATEX=true
+MM_SERVICESETTINGS_COLLAPSEDTHREADS=default_on
+MM_SERVICESETTINGS_ENABLECUSTOMGROUPS=true
+
+# --- Announcements ---
+MM_ANNOUNCEMENTSETTINGS_ENABLEBANNER=true
+MM_ANNOUNCEMENTSETTINGS_BANNERTEXT="🚀 CI/CD City: Systems Operational"
+MM_ANNOUNCEMENTSETTINGS_BANNERCOLOR="#20a83b"
+
+# --- Advanced "Cool" Features ---
+
+# 1. Performance Metrics (Port 8067)
+MM_METRICSSETTINGS_ENABLE=true
+MM_METRICSSETTINGS_LISTENADDRESS=:8067
+
+# 2. Guest Access
+MM_GUESTACCOUNTSSETTINGS_ENABLE=true
+
+# 3. Automation Freedom
+MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION=true
+MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS=true
+
+# 4. Hardened Security (MFA)
+MM_SERVICESETTINGS_ENABLEMULTIFACTORAUTHENTICATION=true
+
+# 5. Urgent Messaging
+MM_SERVICESETTINGS_POSTPRIORITY=true
+
+# 6. Culture (Custom Emoji)
+MM_SERVICESETTINGS_ENABLECUSTOMEMOJI=true
+
+# --- Plugins (Force Enable for Entry Mode) ---
+# NOTE: We only enable them here. Specific config is handled by 08-configure-plugins.py
+# Added: com.mattermost.plugin-jenkins
+MM_PLUGINSETTINGS_PLUGINSTATES={"playbooks":{"Enable":true},"focalboard":{"Enable":true},"com.mattermost.calls":{"Enable":true},"mattermost-ai":{"Enable":true},"com.github.manland.mattermost-plugin-gitlab":{"Enable":true},"jenkins":{"Enable":true}}
+
+# --- WebRTC (The Radio Tower) ---
+# 1. Connectivity (Moved to 8444 to avoid conflict with Artifactory on 8443)
+MM_CALLS_UDP_SERVER_PORT=8444
+MM_CALLS_TCP_SERVER_PORT=8444
+MM_CALLS_ICE_SERVERS_CONFIGS=[{"urls":["turn:$LAN_IP:3478"],"username":"mattermost","credential":"$MATTERMOST_TURN_SECRET"}]
+
+# 2. Network Stability
+MM_CALLS_ICE_HOST_OVERRIDE=$LAN_IP
+
+# 3. User Permissions
+MM_CALLS_DEFAULT_ENABLED=true
+
+# 4. Features
+MM_CALLS_ALLOW_SCREEN_SHARING=true
+MM_CALLS_ICE_HOST_PORT_OVERRIDE=8444
+
+# 5. Mobile & CORS Fixes
+MM_SERVICESETTINGS_ALLOWCORSFROM=*
+MM_SERVICESETTINGS_ENABLEINSECUREOUTGOINGCONNECTIONS=true
+EOF
+
+# Secure the env file (readable by owner only)
+chmod 600 "$SCOPED_ENV_FILE"
+
+# --- 6. Final Permissions Lock ---
+echo "--- Phase 5: Locking Permissions (UID 2000) ---"
+# FIX: We ONLY chown the directories that need to be bind-mounted.
+# We leave the .env file owned by the current user so docker run can read it.
+sudo chown -R 2000:2000 "$MATTERMOST_BASE/config"
+sudo chown -R 2000:2000 "$MATTERMOST_BASE/certs"
+
+# The Key file must be readable by the app (0600 owned by 2000)
+# (Already handled by the recursive chown above, but ensuring mode)
+sudo chmod 600 "$MM_CERTS_DIR/key.pem"
+
+echo "✅ Setup Complete."
+echo "   - Config written to $SCOPED_ENV_FILE."
+echo "   - Bind Mounts ownership transferred to UID 2000."
+```
+
+### Deconstructing the Architect
+
+**1. The "Split-Brain" Certificate Strategy (Phase 3)**
+Notice the `[alt_names]` block. We explicitly define `IP.2 = $LAN_IP`. This dynamic injection is what makes the certificate "Mobile-Ready." Unlike our standard scripts which only care about the DNS name (`mattermost.cicd.local`), this script queries the host's actual network interface (`hostname -I`) and bakes that physical address into the cryptographic identity. This ensures that when an Android phone connects to `192.168.0.x`, the certificate matches the URL.
+
+**2. The Key Length Fix (Phase 1)**
+We use two different generator functions: `generate_secret` (64 hex chars) and `generate_aes_key` (16 hex chars). This is a critical distinction. The At-Rest Encryption Key and Plugin Encryption Keys rely on AES-256. This algorithm strictly requires a **32-byte key**. If we used the standard 64-char generator (which results in 64 bytes when hex-encoded), the Mattermost server would crash on startup with a generic `invalid key size` error. We are precise here to prevent runtime failures.
+
+**3. The WebRTC Configuration (Phase 4)**
+In the environment file generation, we configure the **Calls** plugin immediately.
+
+* `MM_CALLS_ICE_HOST_OVERRIDE=$LAN_IP`: This forces the server to advertise the LAN IP, not the internal Docker IP (`172.x`), ensuring the phone knows where to send the video packets.
+* `MM_CALLS_UDP_SERVER_PORT=8444`: We shift the media port from the default (8443) to 8444. This avoids a collision with **Artifactory** (Article 9), which already claimed 8443 for its HTTPS interface. In a "City," port discipline is mandatory.
+* 
