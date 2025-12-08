@@ -43,3 +43,70 @@ So, our mission in this article is twofold:
 2.  **The War Room:** We will deploy a fully functional, self-hosted Video Conferencing stack using the Mattermost **Calls** plugin.
 
 This second requirement will force us to confront one of the most notorious "Dragons" in self-hosted networking: **NAT Traversal**. Unlike simple HTTP traffic, which flows easily through Docker containers, real-time video relies on **WebRTC** (Web Real-Time Communication). This protocol is allergic to the complex layers of Network Address Translation (NAT) found in Docker. To make this work—specifically to make it work on a mobile phone over WiFi—we will have to build a dedicated "Radio Tower" (TURN Server) to relay the signal over the walls of our container fortress.
+
+# Chapter 2: Architecture - The Fortress and the Phone
+
+## 2.1 The "Enterprise" Hack (Entry Mode)
+
+Our first architectural decision concerns the software edition. Mattermost offers two primary Docker images: the purely open-source **Team Edition** (`mattermost-team-edition`) and the commercial **Enterprise Edition** (`mattermost-enterprise-edition`).
+
+Historically, self-hosters strictly deployed the Team Edition to avoid licensing nags. However, Mattermost has shifted its distribution model. They now encourage even free users to deploy the **Enterprise Image**. When deployed without a license key, this image runs in a special state known as **"Entry Mode."**
+
+We will adopt this modern approach.
+
+We choose the Enterprise image not because we intend to pirate software, but because the Team Edition is functionally incomplete for a modern DevOps workflow. By running the Enterprise image in Entry Mode, we unlock the **"Intelligent Mission Environment."** This grants us access to powerful tools like **Boards** (Kanban project management) and **Playbooks** (incident response checklists)—features that are entirely stripped from the Team build.
+
+This power comes with constraints. Entry Mode imposes hard limits designed to encourage commercial upgrades:
+* **10,000 Message Search Limit:** Older messages remain in the database but vanish from search results.
+* **Single Node Only:** We cannot cluster the application for High Availability.
+* **Feature Caps:** Limits on active Playbooks and Board cards.
+
+For our "First Principles" laboratory, these limits are acceptable. For a production client, we would strongly advise purchasing a license to lift these gates. But for us, this strategy gives us Ferrari features on a Corolla budget.
+
+Finally, we will treat our database as a commodity. In **Article 9**, we established a centralized **PostgreSQL 17** cluster. Mattermost will not spawn its own private database container; it will simply be another tenant in our existing "Water Treatment Plant," connecting via our internal `cicd-net`. This reduces our resource footprint and ensures our chat data benefits from the same backup and security policies as our artifact data.
+
+## 2.2 The "Mobile-Ready" Trust
+
+The second architectural challenge is **Trust**, specifically how trust varies across different devices in our ecosystem.
+
+In previous articles, we established a "Local Root of Trust" using our custom Certificate Authority (CA). On our desktop machines, this system works flawlessly. We imported our Root CA into the operating system's trust store (Debian/Ubuntu/MacOS), and our browsers immediately recognized `gitlab.cicd.local` and `jenkins.cicd.local` as secure. We relied on a simple `/etc/hosts` modification to route those domain names to `127.0.0.1`, effectively tricking the browser into believing the server was local.
+
+However, our Command Center has a requirement that our other tools did not: **Mobile Access**. We want to receive alerts and join "War Room" calls from our Android or iOS devices while roaming around the office (connected to WiFi).
+
+This introduces a hostile environment. Mobile operating systems, particularly modern Android (11+), are notoriously strict about TLS security. They present two specific barriers that break our standard desktop strategy:
+
+1.  **The DNS Barrier:** You cannot easily edit the `/etc/hosts` file on a non-rooted Android phone. This means the phone has no idea who `mattermost.cicd.local` is. It relies entirely on the network's DNS server. Unless we run a custom DNS server on our LAN (like Pi-hole), the phone will fail to resolve the domain name.
+2.  **The IP Barrier:** To bypass the DNS issue, we might try to connect directly via the server's LAN IP address (e.g., `https://192.168.0.105:8065`). However, standard SSL certificates are issued to *Domain Names*, not *IP Addresses*. If we use our standard certificate, the app will reject the connection because the "Common Name" (domain) does not match the "Host" (IP) in the address bar.
+3.  **The Trust Barrier:** Even if the IP matches, the Android app does not trust our custom CA by default. It will throw a generic, often cryptic error like "Trusted Anchor not found" or simply "Cannot connect to server."
+
+To solve this, we must engineer a **"Mobile-Ready" Certificate**. We cannot use the generic certificate generation script we built in Article 6. We need a specialized issuance process that explicitly bakes the **LAN IP Address** into the certificate's **Subject Alternative Names (SANs)** field.
+
+By adding `IP:192.168.x.x` to the certificate, we create a cryptographic identity that is valid even when accessed via a raw IP address. This allows us to bypass the DNS problem entirely. We simply tell the mobile app to connect to the IP, and because the certificate explicitly claims that IP, the TLS handshake succeeds—provided we also manually install the Root CA on the device (which we will cover in the deployment phase). This architectural foresight turns a "connection refused" error into a functioning mobile command post.
+
+## 2.3 The "Radio Tower" (Coturn & Host Networking)
+
+The final and most formidable piece of our architecture is the **Video Conferencing** stack. This requirement forces us to leave the comfortable world of HTTP and confront the chaotic reality of **WebRTC** (Web Real-Time Communication).
+
+In our previous articles, every service we deployed—GitLab, Jenkins, SonarQube—communicated using TCP/IP over HTTP. This model is simple: the client opens a connection to the server, sends a request, and waits for a response. It is reliable, predictable, and remarkably tolerant of network layers like Docker's bridge network and Nginx reverse proxies.
+
+**WebRTC is different.** It is designed for real-time audio and video, where latency is the enemy. It prefers **UDP** over TCP because it's faster to drop a lost packet than to wait for retransmission (a glitch is better than a lag). More importantly, WebRTC attempts to establish a **Peer-to-Peer (P2P)** connection directly between two devices to minimize latency.
+
+In a containerized environment, this P2P model breaks instantly.
+
+When your phone (on WiFi) tries to send video to the Mattermost server (in a container), it needs an IP address to target. However, the Mattermost container lives inside a Docker Bridge network. It has an internal IP (e.g., `172.18.0.5`) that is completely invisible to the outside world. To make matters worse, your phone is likely behind its own NAT (Network Address Translation). This scenario is known as **Double NAT**, and it acts as an unbridgeable moat for direct media streams.
+
+To bridge this moat, we need a **TURN Server** (Traversal Using Relays around NAT). We will deploy **Coturn**, the industry-standard open-source TURN server.
+
+Architecturally, Coturn acts as a **"Radio Tower."** It sits on the absolute edge of our network. When direct P2P communication fails (which it always will in Docker), the phone sends its media packets to the Radio Tower. The Tower then relays those packets across the Docker boundary to the Mattermost container.
+
+But deploying Coturn brings its own "Dragon": **The Port Range.**
+
+Unlike a web server that listens on a single port (443), a TURN server requires a massive range of ephemeral UDP ports—typically **32,768 to 65,535**—to handle media streams for multiple users simultaneously. Every active call consumes a port.
+
+If we tried to deploy this using standard Docker Bridge networking, we would have to map every single one of these ports in the `docker run` command or Compose file. This creates two critical problems:
+1.  **The "Docker Proxy" Bottleneck:** For every mapped port, Docker spins up a userland proxy process (`docker-proxy`). Asking Docker to manage 30,000+ proxy rules explodes the memory usage and adds significant CPU latency to every packet, killing call quality.
+2.  **IPTables Bloat:** Creating tens of thousands of NAT rules in the host's firewall table slows down networking for the entire system.
+
+To solve this, we will make a rare exception to our "Isolation First" rule. We will deploy the Coturn container using **Host Networking** (`--network host`).
+
+This mode effectively removes the Docker network isolation layer for this specific container. Coturn will not have a private `172.x.x.x` IP; it will bind directly to the physical network interface of your host machine (`192.168.x.x`). This eliminates the need for port mapping entirely. It gives our Radio Tower a clear, unobstructed line of sight to your mobile device, ensuring that when you press "Join Call," the video flows instantly and efficiently.
