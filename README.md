@@ -704,3 +704,126 @@ You are looking for a specific row in the output table.
 * **Protocol:** `udp`
 
 If you see a candidate of type **`relay`**, it means your device successfully contacted the Coturn server, authenticated with the secret, and received a relay address. The Radio Tower is operational. If you only see `host` or `srflx` candidates, the TURN server is unreachable (check your firewall) or authentication failed (check your secret).
+
+
+# Chapter 5: Deployment - Launching the Town Square
+
+## 5.1 The "Clean Slate" Protocol
+
+We have tuned our database, generated our mobile-ready certificates, and erected our radio tower. The ground is prepared. It is time to deploy the application itself.
+
+We will use our standard **"Launcher"** pattern. This script (`03-deploy-mattermost.sh`) is the enforcement mechanism for our infrastructure. It does not just "start" the container; it ensures that every deployment begins with a predictable, clean state.
+
+This "Clean Slate" protocol—stopping the container, removing it, and verifying volumes before launching—is critical for "Immutable Infrastructure." It guarantees that if we change a configuration variable in `mattermost.env` or update a certificate, the new container will pick up those changes immediately. We never rely on `docker restart`, which often preserves stale state.
+
+This script also handles a specific architectural requirement for Mattermost: **Plugin Persistence**. Unlike Jenkins, where plugins are baked into the image or volume in a single blob, Mattermost benefits from separating its storage concerns. We create four distinct named volumes:
+
+1.  `mattermost-data`: For file uploads and images.
+2.  `mattermost-logs`: For audit trails (critical for security).
+3.  `mattermost-plugins`: For server-side plugin binaries.
+4.  `mattermost-client-plugins`: For the webapp frontend code of those plugins.
+
+By separating these, we ensure that a plugin upgrade doesn't accidentally corrupt our file store, and that we can wipe plugins if necessary without losing user data.
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/03-deploy-mattermost.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               03-deploy-mattermost.sh
+#
+#  The "Town Square" script.
+#  Deploys Mattermost Enterprise Edition (Entry Mode).
+#
+#  1. Network: Connects to 'cicd-net' for internal comms.
+#  2. Ports:
+#     - 8065 (TCP): Main UI/API (Exposed to LAN).
+#     - 8443 (UDP): Calls Plugin SFU (Exposed to LAN).
+#     - 8067 (TCP): Metrics (Exposed to Localhost).
+#  3. Trust:   Mounts Host's ca-certificates.crt (Distroless fix).
+#  4. Config:  Injects 'mattermost.env' (12-Factor).
+#
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Deploying Mattermost (Town Square)..."
+
+# --- 1. Define Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+MATTERMOST_BASE="$HOST_CICD_ROOT/mattermost"
+SCOPED_ENV_FILE="$MATTERMOST_BASE/mattermost.env"
+
+# --- 2. Prerequisite Checks ---
+if [ ! -f "$SCOPED_ENV_FILE" ]; then
+    echo "ERROR: mattermost.env not found."
+    echo "Please run 01-setup-mattermost.sh first."
+    exit 1
+fi
+
+# --- 3. Volume Management ---
+echo "--- Verifying Storage Volumes ---"
+docker volume create mattermost-data >/dev/null
+docker volume create mattermost-logs >/dev/null
+docker volume create mattermost-plugins >/dev/null
+docker volume create mattermost-client-plugins >/dev/null
+# Note: Bleve indexes volume removed (Deprecated in v11)
+
+# --- 4. Clean Slate ---
+if [ "$(docker ps -q -f name=mattermost)" ]; then
+    echo "Stopping existing 'mattermost'..."
+    docker stop mattermost
+fi
+if [ "$(docker ps -aq -f name=mattermost)" ]; then
+    echo "Removing existing 'mattermost'..."
+    docker rm mattermost
+fi
+
+# --- 5. Deploy ---
+echo "--- Launching Container ---"
+
+# CRITICAL PORTS:
+# 8065: Main HTTP traffic (LAN access)
+# 8443/udp: Calls Plugin Media/SFU (LAN access for calls)
+# 8067: Metrics (Localhost only, for Prometheus later)
+
+docker run -d \
+  --name mattermost \
+  --restart always \
+  --network cicd-net \
+  --hostname mattermost.cicd.local \
+  --publish 0.0.0.0:8065:8065 \
+  --publish 0.0.0.0:8444:8444/udp \
+  --publish 0.0.0.0:8444:8444/tcp \
+  --publish 127.0.0.1:8067:8067 \
+  --env-file "$SCOPED_ENV_FILE" \
+  --volume "$MATTERMOST_BASE/config":/mattermost/config:rw \
+  --volume "$MATTERMOST_BASE/certs":/mattermost/certs:ro \
+  --volume mattermost-data:/mattermost/data \
+  --volume mattermost-logs:/mattermost/logs \
+  --volume mattermost-plugins:/mattermost/plugins \
+  --volume mattermost-client-plugins:/mattermost/client/plugins \
+  --volume /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+  mattermost/mattermost-enterprise-edition:release-11
+
+echo "✅ Mattermost deployed."
+echo "   - Main URL: https://mattermost.cicd.local:8065"
+echo "   - Metrics:  http://127.0.0.1:8067/metrics"
+echo "   - Logs:     docker logs -f mattermost"
+echo "   - Trust:    Host CA bundle injected."
+```
+
+### Deconstructing the Launcher
+
+**1. The Trust Injection (`/etc/ssl/certs/...`)**
+This single line solves the "Island Problem" we faced with SonarQube and Jenkins. We mount the host's CA bundle directly over the container's CA bundle. Because we previously installed our Root CA on the host (Article 6), this "brain transplant" allows Mattermost to instantly trust `gitlab.cicd.local` and `jenkins.cicd.local`. Without this, every integration webhook would fail with a certificate error.
+
+**2. The Port Strategy (`8444`)**
+Notice we map port **8444** for both TCP and UDP. This corresponds to the `MM_CALLS_UDP_SERVER_PORT` setting we configured in the Architect script. By explicitly mapping this, we punch a hole through the Docker NAT for our relayed media packets coming from the Coturn server.
+
+**3. The Image Selection (`enterprise-edition:release-11`)**
+We explicitly pull the **Enterprise Edition**. As discussed in Chapter 2, this—combined with the lack of a license key—activates "Entry Mode," giving us access to Boards and Playbooks which are absent in the Team Edition image.
+
+**4. The Localhost Bind (`127.0.0.1:8067`)**
+For the metrics port, we bind strictly to `127.0.0.1`. We do not want our internal performance metrics exposed to the LAN. This allows a future Prometheus instance (running in the same `cicd-net`) to scrape metrics, or us to curl them from the host, but prevents casual snooping from the office WiFi.

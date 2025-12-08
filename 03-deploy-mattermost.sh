@@ -5,7 +5,7 @@
 #               03-deploy-mattermost.sh
 #
 #  The "Town Square" script.
-#  Deploys Mattermost Team Edition (Entry Mode).
+#  Deploys Mattermost Enterprise (Entry Mode).
 #
 #  1. Network: Connects to 'cicd-net' for internal comms.
 #  2. Ports:
