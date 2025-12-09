@@ -1514,145 +1514,138 @@ This surgeon must:
 2.  **Install** it via `mmctl` (the CLI tool).
 3.  **Inject** the configuration payload that binds the plugin to `http://jenkins.cicd.local:10400` using the keys we generated in Chapter 3.
 
-
 ## 8.3 The Surgeon (`09-install-jenkins-plugin.py`)
 
 We will now write the script that performs this delicate operation. This is not a simple "fire and forget" command; it is a multi-step workflow.
 
 The script acts as a specialized package manager. It:
 
-1.  **Downloads** the official Mattermost Jenkins Plugin (v1.1.0) from GitHub.
-2.  **Installs** the binary into the running container using `mmctl`.
-3.  **Patches** the server configuration to inject the Jenkins URL (`http://jenkins.cicd.local:10400`) and the encryption key we generated in Chapter 3.
+1.  **Unlocks** the server's write-protection (`EnableUploads`).
+2.  **Downloads** the plugin bundle (`.tar.gz`) from the release repository.
+3.  **Installs** and **Enables** the binary using `mmctl`.
+4.  **Injects** the specific configuration keys (URL and Encryption Key) using granular `config set` commands.
+5.  **Re-locks** the server.
 
 Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/09-install-jenkins-plugin.py`.
 
 ```python
 #!/usr/bin/env python3
 
+import subprocess
 import os
 import sys
-import json
-import subprocess
-import requests
+import urllib.request
 from pathlib import Path
 
 # --- Configuration ---
-PLUGIN_VERSION = "1.1.0"
-PLUGIN_URL = f"https://github.com/mattermost/mattermost-plugin-jenkins/releases/download/v{PLUGIN_VERSION}/mattermost-plugin-jenkins-{PLUGIN_VERSION}.tar.gz"
-PLUGIN_FILE = f"mattermost-plugin-jenkins-{PLUGIN_VERSION}.tar.gz"
-
-CONTAINER_NAME = "mattermost"
+# Paths
 CICD_ROOT = Path(os.environ.get("HOME")) / "cicd_stack"
 ENV_FILE = CICD_ROOT / "cicd.env"
 
-# --- Helper Functions ---
+# Docker / Plugin Info
+CONTAINER_NAME = "mattermost"
+PLUGIN_URL = "https://github.com/mattermost-community/mattermost-plugin-jenkins/releases/download/v1.1.0/jenkins-1.1.0.tar.gz"
+PLUGIN_FILE = "jenkins-1.1.0.tar.gz"
+PLUGIN_ID = "jenkins" # Community version ID
 
-def get_env_var(var_name):
-    """Reads a specific variable from the cicd.env file."""
+# Commands
+MMCTL = ["docker", "exec", "-i", CONTAINER_NAME, "mmctl", "--local"]
+
+def load_secret_key():
+    """Reads the Jenkins Encryption Key from cicd.env."""
     if not ENV_FILE.exists():
         print(f"❌ Error: {ENV_FILE} not found.")
         sys.exit(1)
-    
-    with open(ENV_FILE, 'r') as f:
+
+    with open(ENV_FILE, "r") as f:
         for line in f:
-            if line.startswith(f"{var_name}="):
-                return line.split('=', 1)[1].strip().strip('"')
+            if line.startswith("MATTERMOST_JENKINS_PLUGIN_KEY="):
+                return line.split('=', 1)[1].strip().strip('"\'')
     return None
 
-def run_mmctl(args, capture=True):
-    """Runs mmctl inside the container."""
-    cmd = ["docker", "exec", "-i", CONTAINER_NAME, "mmctl", "--local"] + args
-    if capture:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise Exception(f"mmctl failed: {result.stderr}")
-        return result.stdout.strip()
-    else:
-        subprocess.run(cmd, check=True)
-
-def install_plugin():
-    print(f"⬇️  Downloading Jenkins Plugin v{PLUGIN_VERSION}...")
+def run_command(cmd, description):
+    """Runs a shell command and prints status."""
+    print(f"   ⚙️  {description}...", end=" ", flush=True)
     try:
-        r = requests.get(PLUGIN_URL, stream=True)
-        r.raise_for_status()
-        with open(PLUGIN_FILE, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-    except Exception as e:
-        print(f"❌ Download failed: {e}")
+        subprocess.run(cmd, check=True, capture_output=True)
+        print("✅")
+    except subprocess.CalledProcessError as e:
+        print("❌")
+        print(f"      Error: {e.stderr.decode().strip()}")
         sys.exit(1)
 
-    print("📦 Installing Plugin via mmctl...")
-    # We copy the file into the container first to ensure mmctl can access it reliably
-    subprocess.run(["docker", "cp", PLUGIN_FILE, f"{CONTAINER_NAME}:/tmp/{PLUGIN_FILE}"], check=True)
-    
-    try:
-        run_mmctl(["plugin", "add", f"/tmp/{PLUGIN_FILE}"], capture=False)
-        run_mmctl(["plugin", "enable", "jenkins"], capture=False)
-        print("✅ Plugin Installed and Enabled.")
-    except Exception as e:
-        print(f"❌ Installation failed: {e}")
-    finally:
-        # Cleanup
-        if os.path.exists(PLUGIN_FILE):
-            os.remove(PLUGIN_FILE)
-        subprocess.run(["docker", "exec", CONTAINER_NAME, "rm", f"/tmp/{PLUGIN_FILE}"], check=False)
+def set_config(path, value):
+    """Sets a config value via mmctl."""
+    # Note: mmctl requires string values
+    cmd = MMCTL + ["config", "set", path, str(value)]
+    run_command(cmd, f"Setting {path}")
 
-def configure_plugin():
-    print("🔧 Configuring Plugin Settings...")
-    
-    # 1. Fetch Secrets
-    encryption_key = get_env_var("MATTERMOST_JENKINS_PLUGIN_KEY")
-    if not encryption_key:
+def main():
+    print("--- 🤖 Automating Jenkins Plugin (mmctl edition) ---")
+
+    # 0. Pre-flight Check
+    jenkins_key = load_secret_key()
+    if not jenkins_key:
         print("❌ Error: MATTERMOST_JENKINS_PLUGIN_KEY not found in cicd.env")
         sys.exit(1)
 
-    # 2. Get Current Config
-    print("   Fetching server config...")
-    config_json_str = run_mmctl(["config", "get"])
-    
+    # 1. Unlock Uploads
+    set_config("PluginSettings.EnableUploads", "true")
+
+    # 2. Download
+    print(f"   ⬇️  Downloading Plugin...", end=" ", flush=True)
+    if not os.path.exists(PLUGIN_FILE):
+        try:
+            urllib.request.urlretrieve(PLUGIN_URL, PLUGIN_FILE)
+            print("✅")
+        except Exception as e:
+            print("❌")
+            print(f"      Download failed: {e}")
+            sys.exit(1)
+    else:
+        print("✅ (Cached)")
+
+    # 3. Transfer
+    print(f"   📦 Copying to container...", end=" ", flush=True)
+    subprocess.run(["docker", "cp", PLUGIN_FILE, f"{CONTAINER_NAME}:/tmp/{PLUGIN_FILE}"], check=True)
+    print("✅")
+
+    # 4. Install (Robust)
+    print(f"   ⚙️  Installing Plugin bundle...", end=" ", flush=True)
     try:
-        config = json.loads(config_json_str)
-    except json.JSONDecodeError:
-        # Sometimes mmctl returns non-json text (e.g. warnings) before the json
-        # We try to split by the first curly brace
-        config_json_str = "{" + config_json_str.split("{", 1)[1]
-        config = json.loads(config_json_str)
+        subprocess.run(MMCTL + ["plugin", "add", f"/tmp/{PLUGIN_FILE}"], check=True, capture_output=True)
+        print("✅")
+    except subprocess.CalledProcessError as e:
+        if "already installed" in e.stderr.decode():
+            print("⚠️  (Already Installed)")
+        else:
+            print("❌")
+            print(f"      Error: {e.stderr.decode().strip()}")
+            sys.exit(1)
 
-    # 3. Patch the Jenkins Config
-    # Note: Structure is PluginSettings -> Plugins -> jenkins
-    if "PluginSettings" not in config:
-        config["PluginSettings"] = {}
-    if "Plugins" not in config["PluginSettings"]:
-        config["PluginSettings"]["Plugins"] = {}
-        
-    jenkins_config = {
-        "jenkinsurl": "http://jenkins.cicd.local:10400",
-        "encryptionkey": encryption_key,
-        "salt": encryption_key # Reusing key as salt for simplicity in this lab
-    }
+    # 5. Enable
+    # This initializes the default config structure in the DB
+    run_command(MMCTL + ["plugin", "enable", PLUGIN_ID], f"Enabling '{PLUGIN_ID}'")
 
-    config["PluginSettings"]["Plugins"]["jenkins"] = jenkins_config
+    # 6. Configure via mmctl
+    # We use the exact keys confirmed from your config dump: 'jenkinsurl' and 'encryptionkey'
+    # The Base Path for mmctl is PluginSettings.Plugins.jenkins
+    print("   🔌 Configuring Plugin settings...")
 
-    # 4. Upload New Config
-    print("   Applying new configuration...")
-    # We write the JSON to a file in the container, then tell mmctl to load it.
-    # Passing large JSON via command line args is fragile.
-    
-    with open("temp_config.json", "w") as f:
-        json.dump(config, f)
-        
-    subprocess.run(["docker", "cp", "temp_config.json", f"{CONTAINER_NAME}:/tmp/config.json"], check=True)
-    run_mmctl(["config", "load", "/tmp/config.json"], capture=False)
-    
-    os.remove("temp_config.json")
-    print("✅ Configuration Patched.")
+    # 6a. Set URL
+    set_config(f"PluginSettings.Plugins.{PLUGIN_ID}.jenkinsurl", "https://jenkins.cicd.local:10400")
 
-def main():
-    install_plugin()
-    configure_plugin()
-    print("\n🎉 Jenkins Plugin fully operational.")
+    # 6b. Set Encryption Key
+    set_config(f"PluginSettings.Plugins.{PLUGIN_ID}.encryptionkey", jenkins_key)
+
+    # 7. Re-Lock Uploads
+    set_config("PluginSettings.EnableUploads", "false")
+
+    # 8. Cleanup
+    if os.path.exists(PLUGIN_FILE):
+        os.remove(PLUGIN_FILE)
+
+    print("[SUCCESS] Jenkins Plugin Installed & Configured.")
 
 if __name__ == "__main__":
     main()
@@ -1660,20 +1653,18 @@ if __name__ == "__main__":
 
 ### Deconstructing the Surgeon
 
-**1. The `mmctl` Bootstrap**
-Just like in Chapter 7, we rely on `mmctl --local`. However, notice the extra step in `install_plugin`. We `docker cp` the tarball into the container before running `plugin add`. This eliminates file path issues. The script is effectively performing a "sideload" of the software.
+**1. The `EnableUploads` Toggle (Security)**
+By default, Mattermost prevents plugin uploads to protect the server from unauthorized code execution.
+`set_config("PluginSettings.EnableUploads", "true")`
+The script temporarily lifts this gate, installs the software, and then immediately slams the gate shut again. This reduces the window of vulnerability to mere seconds.
 
-**2. The JSON Patching Strategy**
-This is the core of the script. We cannot simply set one variable. We have to:
+**2. The Granular Config (`PluginSettings.Plugins...`)**
+Unlike environment variables which are broad, `mmctl config set` allows us to target deeply nested JSON keys using dot notation.
+`PluginSettings.Plugins.jenkins.encryptionkey`
+This writes directly to the plugin's private storage area in the `config.json`. It is cleaner and safer than downloading and patching the entire server configuration blob.
 
-1.  Download the *entire* server configuration (`config get`).
-2.  Parse it into a Python dictionary.
-3.  Surgically insert our `jenkins` dictionary into `PluginSettings.Plugins`.
-4.  Upload the *entire* configuration back (`config load`).
-    This pattern is robust. It preserves all other settings (like database passwords or SMTP configs) while ensuring our plugin gets the exact parameters it needs.
-
-**3. The Encryption Key**
-We pull `MATTERMOST_JENKINS_PLUGIN_KEY` from `cicd.env`. This is the 32-character AES key we generated in `01-setup-mattermost.sh`. This key is used by the plugin to encrypt the access tokens it stores in the database. Without this, if you restarted the server, everyone would have to re-authenticate with Jenkins.
+**3. The Encryption Key Injection**
+We pull the 32-byte AES key (`MATTERMOST_JENKINS_PLUGIN_KEY`) from our environment and inject it. This ensures that when the plugin encrypts your personal Jenkins API token in the next step, it uses a key that persists across server restarts. Without this, your handshake would break every time the container redeployed.
 
 ## 8.4 The Handshake: Establishing Command
 
