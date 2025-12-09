@@ -1472,3 +1472,281 @@ Nothing happens.
 This is a **Unidirectional (One-Way)** connection. Jenkins can talk to us, but we cannot talk to Jenkins. In a true "Command Center," we demand control. We want to trigger builds, check logs, and restart servers directly from the chat window without context-switching to the Jenkins UI.
 
 To achieve this, we need to upgrade from simple Webhooks to a full **Interactive Plugin**. This brings us to Chapter 8.
+
+# Chapter 8: The Wiring (Part 2) - The Interactive Agent
+
+## 8.1 Beyond Notification: The Need for Command
+
+In the previous chapter, we successfully wired the nerves of our city. When Jenkins finishes a job, our Mattermost channel lights up. This is valuable—it reduces the "polling loop" where engineers obsessively refresh a browser tab.
+
+But it is passive. It is **Read-Only**.
+
+A true "Command Center" must be **Read-Write**. We don't just want to know that a build failed; we want to restart it. We don't just want to see a deployment notification; we want to *trigger* the deployment. We want to treat the chat window as a shared CLI (Command Line Interface) for our infrastructure.
+
+This is the domain of **Slash Commands**.
+
+We want to type `/jenkins build articles/0004_std_lib_http_client` and have the Factory immediately spin up the turbines. We want to type `/jenkins get-log` to debug a failure without leaving the chat. We even want the power to reboot the factory floor remotely with `/jenkins safe-restart`.
+
+To achieve this, the standard "Incoming Webhook" we used in Chapter 7 is insufficient. That was just a simple POST endpoint. For interactive control, we need the dedicated **Mattermost Jenkins Plugin**. This plugin acts as a bridge, translating Mattermost slash commands into Jenkins API calls, and translating Jenkins API responses back into interactive chat messages.
+
+However, enabling this plugin in a "Code-First" environment involves overcoming a specific configuration hurdle that trips up many automated deployments: the **Plugin ID Dragon**.
+
+## 8.2 The "Missing Limb" Dragon
+
+In **Chapter 3**, when we generated our `mattermost.env` file, we included a specific line to enable the Jenkins plugin:
+
+`MM_PLUGINSETTINGS_PLUGINSTATES={"jenkins":{"Enable":true} ... }`
+
+This directive tells Mattermost to *load* the plugin. However, unlike the "Boards" or "Playbooks" features which are baked into the Enterprise image, the Jenkins plugin is an external add-on. It does not exist on the disk. We tried to flip a switch for a lightbulb that isn't screwed in.
+
+To make this work, we have two distinct tasks:
+1.  **Installation:** We must download the plugin bundle (`.tar.gz`) from the release repository and physically upload it to the Mattermost server.
+2.  **Configuration:** Once installed, the plugin is a blank slate. It doesn't know where Jenkins is, and it doesn't have the encryption keys required to talk to it.
+
+Here lies the architectural dragon: **Plugin Configuration vs. Environment Variables.**
+
+For core Mattermost settings (like database URL), we can simply set `MM_SQLSETTINGS_DATASOURCE`. But for *Plugins*, there is no such mechanism. You cannot set `MM_PLUGINSETTINGS_JENKINS_BASEURL`. Plugin settings live in a complex, unstructured JSON blob inside the server's state.
+
+If we were using "Click-Ops," we would manually upload the file in the System Console and then type the secrets into the UI. But we are building a reproducible city. We need a "Surgeon"—a script that can perform this transplant operation programmatically.
+
+This surgeon must:
+1.  **Download** the latest plugin release.
+2.  **Install** it via `mmctl` (the CLI tool).
+3.  **Inject** the configuration payload that binds the plugin to `http://jenkins.cicd.local:10400` using the keys we generated in Chapter 3.
+
+
+## 8.3 The Surgeon (`09-install-jenkins-plugin.py`)
+
+We will now write the script that performs this delicate operation. This is not a simple "fire and forget" command; it is a multi-step workflow.
+
+The script acts as a specialized package manager. It:
+
+1.  **Downloads** the official Mattermost Jenkins Plugin (v1.1.0) from GitHub.
+2.  **Installs** the binary into the running container using `mmctl`.
+3.  **Patches** the server configuration to inject the Jenkins URL (`http://jenkins.cicd.local:10400`) and the encryption key we generated in Chapter 3.
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/09-install-jenkins-plugin.py`.
+
+```python
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import subprocess
+import requests
+from pathlib import Path
+
+# --- Configuration ---
+PLUGIN_VERSION = "1.1.0"
+PLUGIN_URL = f"https://github.com/mattermost/mattermost-plugin-jenkins/releases/download/v{PLUGIN_VERSION}/mattermost-plugin-jenkins-{PLUGIN_VERSION}.tar.gz"
+PLUGIN_FILE = f"mattermost-plugin-jenkins-{PLUGIN_VERSION}.tar.gz"
+
+CONTAINER_NAME = "mattermost"
+CICD_ROOT = Path(os.environ.get("HOME")) / "cicd_stack"
+ENV_FILE = CICD_ROOT / "cicd.env"
+
+# --- Helper Functions ---
+
+def get_env_var(var_name):
+    """Reads a specific variable from the cicd.env file."""
+    if not ENV_FILE.exists():
+        print(f"❌ Error: {ENV_FILE} not found.")
+        sys.exit(1)
+    
+    with open(ENV_FILE, 'r') as f:
+        for line in f:
+            if line.startswith(f"{var_name}="):
+                return line.split('=', 1)[1].strip().strip('"')
+    return None
+
+def run_mmctl(args, capture=True):
+    """Runs mmctl inside the container."""
+    cmd = ["docker", "exec", "-i", CONTAINER_NAME, "mmctl", "--local"] + args
+    if capture:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"mmctl failed: {result.stderr}")
+        return result.stdout.strip()
+    else:
+        subprocess.run(cmd, check=True)
+
+def install_plugin():
+    print(f"⬇️  Downloading Jenkins Plugin v{PLUGIN_VERSION}...")
+    try:
+        r = requests.get(PLUGIN_URL, stream=True)
+        r.raise_for_status()
+        with open(PLUGIN_FILE, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except Exception as e:
+        print(f"❌ Download failed: {e}")
+        sys.exit(1)
+
+    print("📦 Installing Plugin via mmctl...")
+    # We copy the file into the container first to ensure mmctl can access it reliably
+    subprocess.run(["docker", "cp", PLUGIN_FILE, f"{CONTAINER_NAME}:/tmp/{PLUGIN_FILE}"], check=True)
+    
+    try:
+        run_mmctl(["plugin", "add", f"/tmp/{PLUGIN_FILE}"], capture=False)
+        run_mmctl(["plugin", "enable", "jenkins"], capture=False)
+        print("✅ Plugin Installed and Enabled.")
+    except Exception as e:
+        print(f"❌ Installation failed: {e}")
+    finally:
+        # Cleanup
+        if os.path.exists(PLUGIN_FILE):
+            os.remove(PLUGIN_FILE)
+        subprocess.run(["docker", "exec", CONTAINER_NAME, "rm", f"/tmp/{PLUGIN_FILE}"], check=False)
+
+def configure_plugin():
+    print("🔧 Configuring Plugin Settings...")
+    
+    # 1. Fetch Secrets
+    encryption_key = get_env_var("MATTERMOST_JENKINS_PLUGIN_KEY")
+    if not encryption_key:
+        print("❌ Error: MATTERMOST_JENKINS_PLUGIN_KEY not found in cicd.env")
+        sys.exit(1)
+
+    # 2. Get Current Config
+    print("   Fetching server config...")
+    config_json_str = run_mmctl(["config", "get"])
+    
+    try:
+        config = json.loads(config_json_str)
+    except json.JSONDecodeError:
+        # Sometimes mmctl returns non-json text (e.g. warnings) before the json
+        # We try to split by the first curly brace
+        config_json_str = "{" + config_json_str.split("{", 1)[1]
+        config = json.loads(config_json_str)
+
+    # 3. Patch the Jenkins Config
+    # Note: Structure is PluginSettings -> Plugins -> jenkins
+    if "PluginSettings" not in config:
+        config["PluginSettings"] = {}
+    if "Plugins" not in config["PluginSettings"]:
+        config["PluginSettings"]["Plugins"] = {}
+        
+    jenkins_config = {
+        "jenkinsurl": "http://jenkins.cicd.local:10400",
+        "encryptionkey": encryption_key,
+        "salt": encryption_key # Reusing key as salt for simplicity in this lab
+    }
+
+    config["PluginSettings"]["Plugins"]["jenkins"] = jenkins_config
+
+    # 4. Upload New Config
+    print("   Applying new configuration...")
+    # We write the JSON to a file in the container, then tell mmctl to load it.
+    # Passing large JSON via command line args is fragile.
+    
+    with open("temp_config.json", "w") as f:
+        json.dump(config, f)
+        
+    subprocess.run(["docker", "cp", "temp_config.json", f"{CONTAINER_NAME}:/tmp/config.json"], check=True)
+    run_mmctl(["config", "load", "/tmp/config.json"], capture=False)
+    
+    os.remove("temp_config.json")
+    print("✅ Configuration Patched.")
+
+def main():
+    install_plugin()
+    configure_plugin()
+    print("\n🎉 Jenkins Plugin fully operational.")
+
+if __name__ == "__main__":
+    main()
+```
+
+### Deconstructing the Surgeon
+
+**1. The `mmctl` Bootstrap**
+Just like in Chapter 7, we rely on `mmctl --local`. However, notice the extra step in `install_plugin`. We `docker cp` the tarball into the container before running `plugin add`. This eliminates file path issues. The script is effectively performing a "sideload" of the software.
+
+**2. The JSON Patching Strategy**
+This is the core of the script. We cannot simply set one variable. We have to:
+
+1.  Download the *entire* server configuration (`config get`).
+2.  Parse it into a Python dictionary.
+3.  Surgically insert our `jenkins` dictionary into `PluginSettings.Plugins`.
+4.  Upload the *entire* configuration back (`config load`).
+    This pattern is robust. It preserves all other settings (like database passwords or SMTP configs) while ensuring our plugin gets the exact parameters it needs.
+
+**3. The Encryption Key**
+We pull `MATTERMOST_JENKINS_PLUGIN_KEY` from `cicd.env`. This is the 32-character AES key we generated in `01-setup-mattermost.sh`. This key is used by the plugin to encrypt the access tokens it stores in the database. Without this, if you restarted the server, everyone would have to re-authenticate with Jenkins.
+
+## 8.4 The Handshake: Establishing Command
+
+The Surgeon has successfully transplanted the plugin. Now, we must wake the patient.
+
+We have established the server-to-server link, but we have not yet established the **User-to-User** link. When you type a command, Jenkins needs to know *who* you are. It cannot simply trust your Mattermost username; it needs a valid Jenkins API token belonging to your user.
+
+This requires a manual credential exchange.
+
+### Protocol 1: The Connection (Manual)
+
+1.  **Generate the Token (Jenkins Side):**
+
+    * Navigate to your Jenkins Dashboard (`https://jenkins.cicd.local:10400`).
+    * Click on your **Username** (top right corner) -\> **Configure**.
+    * Scroll to the **API Token** section and click **Add new Token**.
+    * Name it `Mattermost-Bot` and click **Generate**.
+    * **Copy the token immediately.** (You will never see it again).
+
+2.  **Perform the Handshake (Mattermost Side):**
+
+    * Go to the **\#builds** channel in Mattermost.
+    * Type the connect command with your username and the token:
+      ```bash
+      /jenkins connect <your_username> <your_api_token>
+      ```
+      *(Example: `/jenkins connect warren.jitsing 11d38...9a`)*
+
+3.  **Confirmation:**
+
+    * The bot will reply privately: *"Validating Jenkins credentials..."*
+    * Followed by: *"Your Jenkins account has been successfully connected to Mattermost."*
+
+### Protocol 2: The Command
+
+Now, let's test the control.
+
+The error `Don't have key "Location"` is a common trap. It occurs if you try to build a job name that doesn't exist. Jenkins returns a generic page instead of a Queue ID, confusing the plugin.
+
+You must use the exact path. Since we are using Multibranch Pipelines inside a Folder (from Article 8), the path includes the folder, the repo, and the branch.
+
+1.  **Trigger:**
+    Type the following command:
+
+    ```bash
+    /jenkins build articles/0004_std_lib_http_client/main
+    ```
+
+2.  **Response:**
+    You will see immediate feedback confirming the command was received and processed:
+
+    > **Jenkins BOT**
+    > Initiated by Jenkins user: admin
+    > Job 'articles/0004\_std\_lib\_http\_client/main' has been triggered and is in queue.
+
+    Moments later, as the executor picks up the job:
+
+    > **Jenkins BOT**
+    > Initiated by Jenkins user: admin
+    > Job 'articles/0004\_std\_lib\_http\_client/main' - \#14 has been started
+    > Build URL : [https://jenkins.cicd.local:10400/](https://www.google.com/search?q=https://jenkins.cicd.local:10400/)...
+
+    Notice the difference? When the *pipeline* runs automatically (via git push), it is silent until the end. But when *you* trigger it manually via chat, the bot confirms receipt immediately.
+
+### Protocol 3: The Investigation
+
+If you need to peek at the logs while the job is running (or after a failure) without leaving the chat:
+
+1.  **Get Log:**
+    ```bash
+    /jenkins get-log articles/0004_std_lib_http_client/main
+    ```
+2.  **Response:**
+    The bot will fetch the last few lines of the console output and post them as a code snippet directly in the channel.
+
+We have achieved the **Interactive Loop**. We can Observe (Notifications), Orient (Get Log), Decide (Analyze), and Act (Rebuild)—all without touching a browser tab.
