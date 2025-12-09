@@ -93,8 +93,6 @@ def main():
         if hook["name"] == WEBHOOK_NAME:
             exists = True
             print(f"   ℹ️  Webhook '{WEBHOOK_NAME}' already exists.")
-            # Optional: Check if URL matches?
-            # if hook['url'] != webhook_url: ...
             break
 
     # 2. Create Webhook if missing

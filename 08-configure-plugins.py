@@ -78,7 +78,7 @@ def main():
         set_config(f"{base_path}.gitlaboauthclientid", oauth_id)
         set_config(f"{base_path}.gitlaboauthclientsecret", oauth_secret)
         set_config(f"{base_path}.webhooksecret", webhook_secret)
-        # Note: JSON key is 'encryptionkey', NOT 'atrestencryptionkey' based on your config dump
+        # Note: JSON key is 'encryptionkey', NOT 'atrestencryptionkey' based on the config structure
         set_config(f"{base_path}.encryptionkey", enc_key)
 
         # Feature Flags
