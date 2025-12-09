@@ -893,3 +893,582 @@ Because we are accessing the server via an IP address (`192.168.x.x`) but the se
 We solved this preemptively in **Section 3.4**. By setting `MM_SERVICESETTINGS_ALLOWCORSFROM=*`, we instructed the server to drop its shield and accept WebSocket connections from any origin. In a public internet deployment, this would be a security risk. In our private `cicd-net` fortress, it is a necessary concession to allow our mobile devices to speak freely with the Command Center.
 
 With the Certificate installed and CORS unlocked, your mobile Command Center is now fully operational. You can log in, browse channels, and—most importantly—prepare to receive signals from the city we are about to wire up.
+
+# Chapter 7: The Wiring (Part 1) - The Silent Observer
+
+## 7.1 The "Click-Ops" Trap
+
+Our Command Center is online, but it is currently a ghost town. It has no teams, no channels, and no users other than the admin.
+
+In a typical "hobbyist" deployment, this is where you would start clicking. You would log into the web UI, click "Create Team," type "Engineering," click "Create Channel," type "builds," go to the System Console, create a Bot Account, copy the token, save it to a text file... and repeat this process for every tool you want to integrate.
+
+This manual approach—often called "Click-Ops"—is an architectural trap.
+
+1.  **It is not reproducible.** If your server crashes and you have to redeploy, you have to remember every single button click.
+2.  **It is insecure.** Copy-pasting access tokens and webhook URLs through the browser clipboard is a great way to accidentally expose secrets or lose them.
+3.  **It scales poorly.** Managing permissions for three tools is annoying; managing them for thirty is a full-time job.
+
+We are building a **Software Supply Chain**, not a chatroom. Our infrastructure must be defined as code. The creation of our "Engineering" team, our standard channels (`#builds`, `#alerts`, `#code-reviews`), and the bot accounts that own them should be scripted, versioned, and executed automatically.
+
+We need an "Electrician"—a script that walks into the empty building and wires up the lights before the residents arrive.
+
+## 7.2 The Electrician (`04-configure-integrations.py`)
+
+To achieve this automation, we rely on `mmctl`, the official command-line tool for Mattermost. Unlike the web API, `mmctl` has a superpower: **Local Mode**.
+
+When running inside the container (or communicating via the Docker socket), `mmctl` can execute administrative commands without a username or password. It speaks directly to the server process over a Unix socket. This solves the "Bootstrap Paradox"—how do you authenticate to the API to create the first admin user if you don't have an admin user yet?
+
+We will wrap `mmctl` in a Python script. While Bash is great for plumbing, Python is superior for parsing JSON responses and handling the logic flow of "If this webhook exists, don't create it; if it doesn't, create it and save the secret."
+
+This script is our **Electrician**. It establishes the taxonomy of our city:
+
+* **\#builds:** The noisy factory floor where Jenkins reports status.
+* **\#code-reviews:** The library where GitLab announces changes.
+* **\#alerts:** The dedicated red-phone line for SonarQube quality gate failures.
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/04-configure-integrations.py`.
+
+```python
+#!/usr/bin/env python3
+
+import subprocess
+import json
+import time
+import sys
+import os
+import secrets
+from pathlib import Path
+
+# --- Configuration ---
+CICD_ROOT = Path(os.environ.get("HOME")) / "cicd_stack"
+ENV_FILE = CICD_ROOT / "cicd.env"
+CONTAINER_NAME = "mattermost"
+# We use --local to bypass authentication (requires EnableLocalMode=true)
+MMCTL_CMD = ["docker", "exec", "-i", CONTAINER_NAME, "mmctl", "--local", "--json"]
+ADMIN_USER = "warren.jitsing" # The user who will own the webhooks
+
+# --- Entities to Create ---
+TEAM_NAME = "engineering"
+CHANNELS = ["builds", "code-reviews", "alerts", "town-square"]
+
+def run_mmctl(args, allow_fail=False):
+    """Runs an mmctl command inside the container and returns parsed JSON."""
+    cmd = MMCTL_CMD + args
+    try:
+        # check=True is removed so we can handle the return code manually
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+        if result.returncode != 0:
+            if allow_fail:
+                return None
+            print(f"Error running mmctl: {result.stderr}")
+            sys.exit(1)
+
+        output = result.stdout.strip()
+        if not output:
+            return None
+
+        # Attempt 1: Parse the full output as JSON
+        try:
+            data = json.loads(output)
+            if isinstance(data, list):
+                return data[0] if data else None
+            return data
+        except json.JSONDecodeError:
+            # Attempt 2: Fallback for mixed output
+            lines = output.split('\n')
+            if lines:
+                return json.loads(lines[-1])
+            return None
+
+    except Exception as e:
+        if allow_fail:
+            return None
+        print(f"Unexpected error parsing mmctl output: {e}")
+        sys.exit(1)
+
+def read_env_file():
+    """Reads the current state of cicd.env."""
+    if not ENV_FILE.exists():
+        return ""
+    with open(ENV_FILE, "r") as f:
+        return f.read()
+
+def append_to_env(key, value):
+    """Appends a secret to the master cicd.env file."""
+    print(f"   💾 Writing {key} to cicd.env...")
+    with open(ENV_FILE, "a") as f:
+        f.write(f"\n{key}=\"{value}\"\n")
+
+def wait_for_server():
+    print("⏳ Waiting for Mattermost to be ready...")
+    for _ in range(30):
+        try:
+            subprocess.run(
+                ["docker", "exec", CONTAINER_NAME, "mmctl", "--local", "system", "version"],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print("✅ Mattermost is responding.")
+            return
+        except subprocess.CalledProcessError:
+            time.sleep(2)
+    print("❌ Timeout waiting for Mattermost.")
+    sys.exit(1)
+
+def main():
+    if not ENV_FILE.exists():
+        print(f"❌ Error: {ENV_FILE} not found.")
+        sys.exit(1)
+
+    wait_for_server()
+    env_content = read_env_file()
+
+    # 1. Create Team
+    print(f"--- Configuring Team: {TEAM_NAME} ---")
+    res = run_mmctl(["team", "create", "--name", TEAM_NAME, "--display-name", "Engineering"], allow_fail=True)
+    if res:
+        print(f"   ✅ Team '{TEAM_NAME}' created.")
+    else:
+        print(f"   ℹ️  Team '{TEAM_NAME}' likely exists.")
+
+    # FIX: Add Admin User to Team so they can own webhooks
+    print(f"   Ensuring {ADMIN_USER} is in {TEAM_NAME}...")
+    run_mmctl(["team", "users", "add", TEAM_NAME, ADMIN_USER], allow_fail=True)
+
+    # 2. Create Channels
+    print(f"--- Configuring Channels ---")
+    for channel in CHANNELS:
+        subprocess.run(
+            ["docker", "exec", CONTAINER_NAME, "mmctl", "--local", "channel", "create",
+             "--team", TEAM_NAME, "--name", channel, "--display-name", channel.capitalize()],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        print(f"   ✅ Channel '#{channel}' ensured.")
+
+    # 3. Configure Jenkins Integration (Bot + Webhook)
+    print(f"--- Configuring Jenkins Integration ---")
+
+    # 3a. Ensure Bot User Exists (Identity)
+    bot_password = ""
+    if "JENKINS_BOT_PASSWORD" in env_content:
+        for line in env_content.splitlines():
+            if line.startswith("JENKINS_BOT_PASSWORD="):
+                bot_password = line.split("=", 1)[1].strip('"')
+    else:
+        print("   🎲 Generating high-entropy Bot Password...")
+        bot_password = secrets.token_urlsafe(24)
+        append_to_env("JENKINS_BOT_PASSWORD", bot_password)
+        env_content += f"\nJENKINS_BOT_PASSWORD={bot_password}"
+
+    bot_email = "jenkins-bot@cicd.local"
+    bot_user = "jenkins-bot"
+
+    print("   Ensuring Jenkins Bot User exists...")
+    run_mmctl(["user", "create", "--email", bot_email, "--username", bot_user, "--password", bot_password], allow_fail=True)
+    run_mmctl(["user", "verify", bot_user], allow_fail=True)
+    run_mmctl(["team", "users", "add", TEAM_NAME, bot_user], allow_fail=True)
+
+    # 3b. Create Webhook for Notifications (Required by Jenkins Notification Plugin)
+    if "JENKINS_MATTERMOST_WEBHOOK" in env_content:
+        print("   ℹ️  JENKINS_MATTERMOST_WEBHOOK already exists. Skipping.")
+    else:
+        print("   Creating Incoming Webhook for #builds...")
+        # FIX: Use fully qualified channel name and ADMIN_USER ownership
+        hook_res = run_mmctl(["webhook", "create-incoming", "--user", ADMIN_USER, "--channel", f"{TEAM_NAME}:builds", "--display-name", "Jenkins", "--description", "Build Notifications"])
+
+        if hook_id := hook_res.get("id"):
+            webhook_url = f"https://mattermost.cicd.local:8065/hooks/{hook_id}"
+            append_to_env("JENKINS_MATTERMOST_WEBHOOK", webhook_url)
+            env_content += f"\nJENKINS_MATTERMOST_WEBHOOK={webhook_url}"
+
+    # 4. Create SonarQube Webhook (#alerts)
+    print(f"--- Configuring SonarQube Webhook ---")
+
+    if "SONAR_MATTERMOST_WEBHOOK" in env_content:
+        print("   ℹ️  SONAR_MATTERMOST_WEBHOOK already exists. Skipping.")
+    else:
+        print("   Creating Incoming Webhook for #alerts...")
+        hook_res = run_mmctl(["webhook", "create-incoming", "--user", ADMIN_USER, "--channel", f"{TEAM_NAME}:alerts", "--display-name", "SonarQube", "--description", "Quality Gate Alerts"])
+
+        if hook_id := hook_res.get("id"):
+            webhook_url = f"https://mattermost.cicd.local:8065/hooks/{hook_id}"
+            append_to_env("SONAR_MATTERMOST_WEBHOOK", webhook_url)
+            env_content += f"\nSONAR_MATTERMOST_WEBHOOK={webhook_url}"
+
+    # 5. Create GitLab Webhook (#code-reviews)
+    print(f"--- Configuring GitLab Webhook ---")
+
+    if "MATTERMOST_CODE_REVIEW_WEBHOOK" in env_content:
+        print("   ℹ️  MATTERMOST_CODE_REVIEW_WEBHOOK already exists. Skipping.")
+    else:
+        print("   Creating Incoming Webhook for #code-reviews...")
+        hook_res = run_mmctl(["webhook", "create-incoming", "--user", ADMIN_USER, "--channel", f"{TEAM_NAME}:code-reviews", "--display-name", "GitLab", "--description", "Commit and Merge Request Events"])
+
+        if hook_id := hook_res.get("id"):
+            webhook_url = f"https://mattermost.cicd.local:8065/hooks/{hook_id}"
+            append_to_env("MATTERMOST_CODE_REVIEW_WEBHOOK", webhook_url)
+
+    print("\n✅ Configuration Complete.")
+    print("   Restart Jenkins/SonarQube to pick up new secrets.")
+
+if __name__ == "__main__":
+    main()
+```
+
+### Deconstructing the Electrician
+
+**1. The "Local Mode" Bypass**
+The script uses `docker exec ... mmctl --local`. This is the key. It allows us to configure the server from the outside without needing to manually create an admin user first or wrestle with login tokens. We are manipulating the server's brain directly via its command socket.
+
+**2. Idempotency (The "Check First" Logic)**
+Notice how the script checks for existing environment variables (`if "JENKINS_MATTERMOST_WEBHOOK" in env_content`). This prevents duplicate webhooks. If you run the script ten times, it will only create the resources once. This is a core tenet of Infrastructure as Code.
+
+**3. The Secret Extraction**
+When `mmctl` creates a webhook, it returns a JSON object containing the ID. We parse this ID immediately, construct the full URL (`https://mattermost.../hooks/ID`), and append it to our master `cicd.env` file. This eliminates the "Copy-Paste Risk." The secret moves directly from the generator to the vault, untouched by human hands.
+
+## 7.3 The Connector (`05-connect-jenkins.sh`)
+
+We have created the destination (the `#builds` channel) and generated the address (the webhook URL). Now we must hand that address to the Factory.
+
+In **Article 8**, we deployed Jenkins using **Configuration as Code (JCasC)**. We did not use the UI to set up our system message or credentials. We defined them in a YAML file (`jenkins.yaml`). To add Mattermost notifications, we must modify that YAML file.
+
+However, we cannot simply hardcode the webhook URL into the YAML. That would be a security violation (checking secrets into git) and an idempotency failure (the secret is generated dynamically by the previous script).
+
+We need a "Hot-Patcher." We need a script that reads the fresh secret from `cicd.env`, injects it into the `jenkins.env` file, and then updates the `jenkins.yaml` configuration to use that variable.
+
+We will split this into two parts: a Python helper to handle the YAML surgery, and a Bash script to orchestrate the deployment.
+
+**Part 1: The YAML Surgeon**
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/update_jcasc_mattermost.py`.
+
+```python
+#!/usr/bin/env python3
+
+import sys
+import yaml
+import os
+
+# Target the LIVE configuration
+JCAS_FILE = os.path.expanduser("~/cicd_stack/jenkins/config/jenkins.yaml")
+
+def update_jcasc():
+    print(f"[INFO] Reading JCasC file: {JCAS_FILE}")
+
+    try:
+        with open(JCAS_FILE, 'r') as f:
+            jcasc = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"[ERROR] File not found: {JCAS_FILE}")
+        sys.exit(1)
+
+    # Configure Mattermost Notification Plugin (Global)
+    print("[INFO] Injecting Mattermost Global Configuration...")
+
+    if 'unclassified' not in jcasc:
+        jcasc['unclassified'] = {}
+
+    # CORRECTED SCHEMA:
+    # 1. Valid attributes only (endpoint, room, buildServerUrl, icon).
+    # 2. Room set to 'engineering@builds' (Team@Channel format verified by user).
+    jcasc['unclassified']['mattermostNotifier'] = {
+        'endpoint': '${MATTERMOST_JENKINS_WEBHOOK_URL}',
+        'room': 'engineering@builds',
+        'buildServerUrl': 'https://jenkins.cicd.local:10400/',
+        'icon': 'https://mattermost.org/wp-content/uploads/2016/04/icon.png'
+    }
+
+    # Write back to file
+    print("[INFO] Writing updated JCasC file...")
+    with open(JCAS_FILE, 'w') as f:
+        yaml.dump(jcasc, f, default_flow_style=False, sort_keys=False)
+
+    print("[INFO] JCasC update complete.")
+
+if __name__ == "__main__":
+    update_jcasc()
+```
+
+**Part 2: The Orchestrator**
+
+This script ties it all together. It reads the secret, runs the python helper, and then triggers a Jenkins redeployment to pick up the changes.
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0011_cicd_part07_mattermost/05-connect-jenkins.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               05-connect-jenkins.sh
+#
+#  Integrates Jenkins with Mattermost via Webhook.
+#
+#  1. Secrets: Reads JENKINS_MATTERMOST_WEBHOOK (host)
+#              -> Injects MATTERMOST_JENKINS_WEBHOOK_URL (jenkins.env).
+#  2. JCasC:   Updates jenkins.yaml with Notifier config.
+#  3. Apply:   Re-deploys Jenkins.
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- Paths ---
+CICD_ROOT="$HOME/cicd_stack"
+# Adjust this path if your Jenkins article folder is named differently
+JENKINS_MODULE_DIR="$HOME/Documents/FromFirstPrinciples/articles/0008_cicd_part04_jenkins"
+JENKINS_ENV_FILE="$JENKINS_MODULE_DIR/jenkins.env"
+DEPLOY_SCRIPT="$JENKINS_MODULE_DIR/03-deploy-controller.sh"
+
+# Path to the Python helper (Local to this script)
+PY_HELPER="./update_jcasc_mattermost.py"
+MASTER_ENV="$CICD_ROOT/cicd.env"
+
+echo "[INFO] Starting Jenkins <-> Mattermost Integration..."
+
+# --- 1. Secret Injection ---
+if [ ! -f "$MASTER_ENV" ]; then
+    echo "[ERROR] Master environment file not found: $MASTER_ENV"
+    exit 1
+fi
+
+# Load secrets
+source "$MASTER_ENV"
+
+if [ -z "$JENKINS_MATTERMOST_WEBHOOK" ]; then
+    echo "[ERROR] JENKINS_MATTERMOST_WEBHOOK not found in cicd.env."
+    echo "       Please run 04-configure-integrations.py first."
+    exit 1
+fi
+
+if [ ! -f "$JENKINS_ENV_FILE" ]; then
+    echo "[ERROR] Jenkins env file not found at: $JENKINS_ENV_FILE"
+    exit 1
+fi
+
+echo "[INFO] Injecting Mattermost Webhook into jenkins.env..."
+
+# Idempotency check using grep
+if ! grep -q "MATTERMOST_JENKINS_WEBHOOK_URL" "$JENKINS_ENV_FILE"; then
+cat << EOF >> "$JENKINS_ENV_FILE"
+
+# --- Mattermost Integration ---
+MATTERMOST_JENKINS_WEBHOOK_URL=$JENKINS_MATTERMOST_WEBHOOK
+EOF
+    echo "[INFO] Secrets injected."
+else
+    echo "[INFO] Secrets already present."
+fi
+
+# --- 2. Update JCasC ---
+echo "[INFO] Updating JCasC configuration..."
+if [ ! -f "$PY_HELPER" ]; then
+    echo "[ERROR] Python helper script not found at $PY_HELPER"
+    exit 1
+fi
+
+# Install yaml if missing (on host)
+if ! python3 -c "import yaml" 2>/dev/null; then
+    sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
+fi
+
+python3 "$PY_HELPER"
+
+# --- 3. Re-Deploy Jenkins ---
+echo "[INFO] Triggering Jenkins Re-deployment..."
+
+if [ ! -x "$DEPLOY_SCRIPT" ]; then
+    echo "[ERROR] Deploy script not found: $DEPLOY_SCRIPT"
+    exit 1
+fi
+
+(cd "$JENKINS_MODULE_DIR" && ./03-deploy-controller.sh)
+
+echo "[SUCCESS] Jenkins is restarting with Mattermost integration."
+```
+
+### Deconstructing the Connector
+
+**1. The Variable Hand-Off**
+This script performs a crucial bridging operation. It takes `JENKINS_MATTERMOST_WEBHOOK` (which lives in the host's `cicd.env`) and injects it into `jenkins.env` as `MATTERMOST_JENKINS_WEBHOOK_URL`. Why rename it? Because inside the Jenkins container, we want clear namespacing. This variable is then referenced in the JCasC file as `${MATTERMOST_JENKINS_WEBHOOK_URL}`. This ensures the secret is never written to disk in the YAML file; it is only resolved in memory at runtime.
+
+**2. The Team@Channel Format**
+In the Python script, notice the room configuration: `'room': 'engineering@builds'`. The Mattermost plugin requires this specific syntax to target a channel within a specific team. If we just put `builds`, it might default to the wrong team or fail silently.
+
+**3. The Redeployment Trigger**
+The script concludes by running `03-deploy-controller.sh` from the Jenkins directory. This is not optional. JCasC reloading can sometimes be done on the fly, but injecting new environment variables (the webhook URL) requires a container restart. We force a clean deploy to ensure the new "nerve" is fully attached.
+
+# Chapter 7: The Wiring (Part 1) - The Silent Observer
+
+## 7.4 The Pipeline Update (`Jenkinsfile`)
+
+We have connected the cable (the webhook), but we haven't told the operator when to press the button.
+
+While the JCasC configuration we just applied sets up the *default* connection details (the endpoint and the default room), we want granular control over *what* gets sent and *where*.
+
+Specifically, we want to implement a routing logic that matches our "City" taxonomy:
+
+1.  **General Status:** Success/Failure notifications for the build itself should go to **\#builds**.
+2.  **Quality Alerts:** If the Inspector (SonarQube) blocks the pipeline, that specific alarm should ring in **\#alerts**.
+
+To achieve this, we must update our project's `Jenkinsfile`. We will use the `mattermostSend` step provided by the plugin. Note how we override the channel in the Quality Gate block to route that specific message to `engineering@alerts`.
+
+Update your `Jenkinsfile` in the `0004_std_lib_http_client` project (or your test repo) with the following content:
+
+```groovy
+pipeline {
+    agent {
+        label 'general-purpose-agent'
+    }
+
+    stages {
+        stage('Setup & Build') {
+            steps {
+                echo '--- Building Project ---'
+                sh 'chmod +x ./setup.sh'
+                sh './setup.sh'
+            }
+        }
+
+        stage('Test & Coverage') {
+            steps {
+                echo '--- Running Tests ---'
+                sh 'chmod +x ./run-coverage-cicd.sh'
+                sh './run-coverage-cicd.sh'
+            }
+        }
+
+        stage('Code Analysis') {
+            steps {
+                script {
+                    def sonarProjectKey = sh(returnStdout: true, script: 'grep "^sonar.projectKey=" sonar-project.properties | cut -d= -f2').trim()
+
+                    def sonarHostUrl = "http://sonarqube.cicd.local:9000"
+
+                    withSonarQubeEnv('SonarQube') {
+                        sh 'sonar-scanner'
+                    }
+
+                    // 3. Wait for Quality Gate
+                    timeout(time: 5, unit: 'MINUTES') {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            // ROUTING: Quality Gate failures go to #alerts
+                            mattermostSend (
+                                color: 'danger',
+                                channel: 'engineering@alerts',
+                                message: ":no_entry: **Quality Gate Failed**: ${qg.status}\n<${sonarHostUrl}/dashboard?id=${sonarProjectKey}|View Analysis>"
+                            )
+                            error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Package') {
+            steps {
+                echo '--- Packaging Artifacts ---'
+                sh 'mkdir -p dist'
+
+                dir('build_release') {
+                    sh 'cpack -G TGZ -C Release'
+                    sh 'mv *.tar.gz ../dist/'
+                }
+
+                dir('src/rust') {
+                    sh 'cargo package'
+                    sh 'cp target/package/*.crate ../../dist/'
+                }
+
+                sh 'cp build_release/wheelhouse/*.whl dist/'
+            }
+        }
+
+        stage('Publish') {
+            steps {
+                echo '--- Publishing to Artifactory ---'
+
+                rtUpload (
+                    serverId: 'artifactory',
+                    spec: """{
+                          "files": [
+                            {
+                              "pattern": "dist/*",
+                              "target": "generic-local/http-client/${BUILD_NUMBER}/",
+                              "flat": "true"
+                            }
+                          ]
+                    }""",
+                    failNoOp: true,
+                    buildName: "${JOB_NAME}",
+                    buildNumber: "${BUILD_NUMBER}"
+                )
+
+                rtPublishBuildInfo (
+                    serverId: 'artifactory',
+                    buildName: "${JOB_NAME}",
+                    buildNumber: "${BUILD_NUMBER}"
+                )
+            }
+        }
+    }
+
+    // Global Post Actions: Standard notifications go to default channel (#builds)
+    post {
+        failure {
+            mattermostSend (
+                color: 'danger',
+                message: ":x: **Build Failed**\n**Job:** ${env.JOB_NAME} #${env.BUILD_NUMBER}\n(<${env.BUILD_URL}|Open Build>)"
+            )
+        }
+        success {
+            mattermostSend (
+                color: 'good',
+                message: ":white_check_mark: **Build Succeeded**\n**Job:** ${env.JOB_NAME} #${env.BUILD_NUMBER}\n(<${env.BUILD_URL}|Open Build>)"
+            )
+        }
+    }
+}
+```
+
+### Deconstructing the Pipeline
+
+**1. The "Global Post" Block (The Heartbeat)**
+At the bottom of the file, the `post` block handles the routine heartbeat of the factory. Whether the build succeeds or fails, `mattermostSend` fires. Because we do not specify a `channel` parameter here, it defaults to the configuration we injected via JCasC (`engineering@builds`). This creates a steady stream of "Green/Red" status updates in our main channel.
+
+**2. The Conditional Alert (The Alarm Bell)**
+Inside the `Code Analysis` stage, we have a specific `if (qg.status != 'OK')` block. Here, we invoke `mattermostSend` with `channel: 'engineering@alerts'`. This is a critical pattern. We do not want to flood the general `#builds` channel with nitty-gritty quality gate details. By routing this specific failure event to `#alerts`, we ensure that the "Red Phone" only rings when something actually requires inspection.
+
+**3. Contextual Linking**
+Notice how we construct the message string: `<${sonarHostUrl}/dashboard...|View Analysis>`. Mattermost supports Markdown-style links. We are not just saying "It failed"; we are providing a one-click path for the engineer to jump directly to the SonarQube dashboard to see *why* it failed. This reduces the "Time to Diagnosis."
+
+## 7.5 Verification: First Contact
+
+We have completed the electrical wiring. The "Electrician" (`04-configure-integrations.py`) built the channel and the bot. The "Connector" (`05-connect-jenkins.sh`) handed the webhook to Jenkins. The "Pipeline" (`Jenkinsfile`) knows exactly where to route the signals.
+
+Now, we close the circuit.
+
+1.  **Commit and Push:** Commit the updated `Jenkinsfile` to your GitLab repository using our standard conventional commit style.
+    ```bash
+    git add Jenkinsfile
+    git commit -m ":package: build(Jenkinsfile): add mattermost notifications"
+    git push
+    ```
+2.  **Open your Mattermost Tab:** Navigate to the **Engineering** team and open the **\#builds** channel. It should be empty, waiting for a signal.
+3.  **Trigger the Signal:** If your GitLab webhook (from Article 8) is active, the push will trigger a build automatically. If not, open your Jenkins dashboard (`https://jenkins.cicd.local:10400`) and click **"Build Now"** on the project.
+4.  **Observe:**
+
+Wait for the pipeline to finish. Our configuration is designed to be low-noise: it does not spam the channel when the build *starts*, only when it *concludes*.
+
+Once the build finishes, you will see the **Jenkins** bot appear in the `#builds` channel with a definitive verdict: either a green **"Build Succeeded"** or a red **"Build Failed"** message, complete with a hyperlink to the build logs.
+
+If you see this, the nervous system is live. The "Silent City" is no longer silent. Every time a build verdict is reached, the event is broadcast to the team.
+
+However, try to reply to the bot. Type: `@jenkins help` in the channel.
+
+Nothing happens.
+
+This is a **Unidirectional (One-Way)** connection. Jenkins can talk to us, but we cannot talk to Jenkins. In a true "Command Center," we demand control. We want to trigger builds, check logs, and restart servers directly from the chat window without context-switching to the Jenkins UI.
+
+To achieve this, we need to upgrade from simple Webhooks to a full **Interactive Plugin**. This brings us to Chapter 8.
