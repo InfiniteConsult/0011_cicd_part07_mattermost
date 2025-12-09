@@ -827,3 +827,69 @@ We explicitly pull the **Enterprise Edition**. As discussed in Chapter 2, this�
 
 **4. The Localhost Bind (`127.0.0.1:8067`)**
 For the metrics port, we bind strictly to `127.0.0.1`. We do not want our internal performance metrics exposed to the LAN. This allows a future Prometheus instance (running in the same `cicd-net`) to scrape metrics, or us to curl them from the host, but prevents casual snooping from the office WiFi.
+
+# Chapter 6: The Mobile Frontier - Connecting Android
+
+## 6.1 The "Generic Failure" Barrier
+
+We have launched our "Town Square." From your desktop machine, you can likely open a browser, navigate to `https://mattermost.cicd.local:8065`, and see the login screen. The green lock icon is present because your desktop OS trusts the Root CA we installed in Article 6.
+
+Now, we attempt to extend this perimeter to the mobile frontier.
+
+Connect your Android device to the same WiFi network as your host machine. Open the official Mattermost app. Since we cannot easily configure DNS on a standard Android phone to resolve `.local` domains, we bypass the DNS system entirely and enter the raw IP address:
+
+**Server URL:** `https://192.168.X.X:8065` (Replace with your LAN IP)
+
+You will be met with an immediate, generic failure: **"Cannot connect to the server."**
+
+This error message is dangerously misleading. It implies a network timeout or a firewall block. You might waste time checking `iptables` or Docker port mappings. However, the connection is physically reaching the server; it is being rejected at the cryptographic layer.
+
+This is the "Trust Gap." Your Android device has its own segregated store of trusted Certificate Authorities (Google, DigiCert, Let's Encrypt). It has absolutely no knowledge of the "CICD-Root-CA" we generated on our laptop. When the server presents its "Mobile-Ready" certificate, the phone sees a valid cryptographic signature from an unknown entity. It assumes a Man-in-the-Middle attack is in progress and creates a hard stop at the TLS layer.
+
+To fix this, we cannot just change a setting in the app. We must surgically intervene in the device's operating system.
+
+## 6.2 The Manual Trust Protocol
+
+To breach this barrier, we must perform a manual key exchange. We need to take the **Root CA** (`ca.pem`)—the "Master Key" that signed our Mattermost certificate—and import it into the Android "User Credentials" store. This explicitly tells the operating system: *"Trust any certificate signed by this file."*
+
+This is a physical process that varies slightly by Android version, but the core protocol is universal.
+
+**Step 1: Transport the Key**
+First, we must get the file onto the device. Since we are simulating an air-gapped environment, we would typically use a USB cable. For simplicity in this lab, email the `~/cicd_stack/ca/pki/certs/ca.pem` file to an account accessible on the phone.
+Open the email on your Android device and save the attachment to your **Downloads** folder.
+
+**Step 2: The Security Settings**
+Android buries certificate management deep within its security menus to prevent users from accidentally installing malicious roots.
+1.  Open **Settings**.
+2.  In the search bar at the top, type **"certificate"**.
+3.  Select **"CA certificate"** (often found under *Encryption & Credentials* or *Install from storage*).
+4.  If prompted with a frightening warning ("Your data won't be private"), click **"Install anyway"**. This warning exists because a malicious CA could inspect your traffic; however, in this case, *we* are the CA.
+5.  Confirm your identity by entering your **Device PIN** or **Pattern**.
+
+**Step 3: The Import and Verification**
+The file explorer will open. Navigate to your **Downloads** folder (or wherever you saved the file).
+Select the `ca.pem` file.
+You should see a brief "toast" notification: **"CA certificate installed."**
+
+To verify this, we must dig into the user credential store. On modern Android versions, the path is often convoluted:
+Navigate to **Fingerprints, face data and screen lock** -> **Privacy** -> **More security settings** -> **Encryption and credentials** -> **User credentials**.
+
+In this list, you should see your custom CA (e.g., `Local CICD Root CA`). With the root established, the phone now possesses the cryptographic chain of trust required to validate our server's identity.
+
+## 6.3 The "CORS" Dragon
+
+You might expect that installing the certificate would be the end of the battle. You return to the Mattermost app, enter the server URL (`https://192.168.x.x:8065`), and hit connect.
+
+If we had not carefully configured our environment variables in Chapter 3, you would likely hit a second, invisible wall. The app might let you log in, but then immediately disconnect. Or, more subtly, text messages would work, but the status indicators would never update, and video calls would fail to initiate.
+
+This is the **WebSocket** layer failing.
+
+Mattermost uses a persistent WebSocket connection for real-time events (typing indicators, new messages, call signaling). When a mobile app initiates this connection, it sends an HTTP Origin header. Unlike a browser which sends the domain name, mobile apps (depending on the framework) often send `null` or the raw IP address as the Origin.
+
+By default, the Mattermost server is strict. It checks the Origin header against its own `SiteURL`. If they don't match exactly, it slams the door on the WebSocket to prevent Cross-Site WebSocket Hijacking (CSWSH).
+
+Because we are accessing the server via an IP address (`192.168.x.x`) but the server thinks its name is `mattermost.cicd.local`, this check fails. The text API (REST) works, but the real-time API (WebSocket) dies.
+
+We solved this preemptively in **Section 3.4**. By setting `MM_SERVICESETTINGS_ALLOWCORSFROM=*`, we instructed the server to drop its shield and accept WebSocket connections from any origin. In a public internet deployment, this would be a security risk. In our private `cicd-net` fortress, it is a necessary concession to allow our mobile devices to speak freely with the Command Center.
+
+With the Certificate installed and CORS unlocked, your mobile Command Center is now fully operational. You can log in, browse channels, and—most importantly—prepare to receive signals from the city we are about to wire up.
